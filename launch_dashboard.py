@@ -219,8 +219,9 @@ def main():
                        help='Force reload from .npy files (ignore cache)')
     args = parser.parse_args()
     
-    host = '0.0.0.0' if args.remote else args.host
-    port = args.port
+    # For Render: always use 0.0.0.0 and get port from environment
+    host = '0.0.0.0'
+    port = int(os.environ.get('PORT', args.port))
     
     print("=" * 60)
     print("Book Typography Similarity Dashboard")
@@ -231,24 +232,8 @@ def main():
     books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it, cached_order, figures_cache = result
     
     if books is None:
-        print("\nReal data not available. Would you like to:")
-        print("1. Use sample data to test the dashboard")
-        print("2. Exit and run your analysis first")
-        
-        choice = input("Enter choice (1 or 2): ").strip()
-        
-        if choice == "1":
-            books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it, cached_order, figures_cache = create_sample_data()
-        else:
-            print("\nTo use your real data:")
-            print("1. Run your acontrario.ipynb notebook completely")
-            print("2. Add this code at the end to save your results:")
-            print("   np.save('./w_rm_matrix.npy', w_rm)")
-            print("   np.save('./w_it_matrix.npy', w_it)")
-            print("   np.save('./n1hat_rm_matrix.npy', n1hat_rm)")
-            print("   np.save('./n1hat_it_matrix.npy', n1hat_it)")
-            print("3. Run this script again")
-            return
+        print("\nReal data not available. Using sample data for Render deployment.")
+        books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it, cached_order, figures_cache = create_sample_data()
     
     # Create and launch dashboard
     print(f"\nCreating dashboard with {len(books)} books...")
@@ -284,24 +269,13 @@ def main():
     
     print("\n" + "=" * 60)
     print(f"Dashboard starting at http://{host}:{port}")
-    if host == '0.0.0.0':
-        print(f"\n📡 REMOTE ACCESS ENABLED")
-        print(f"   Local access:  http://localhost:{port}")
-        print(f"   Remote access: http://{local_ip}:{port}")
-        print(f"\n⚠️  Make sure port {port} is open in your firewall!")
-    if args.threaded:
-        print(f"🧵 Multi-threaded mode enabled (better for multiple users)")
-    print("\nPress Ctrl+C to stop the server")
+    print("If running on Render, your public URL will be provided by the Render dashboard.")
     print("=" * 60)
     
     
     server = dashboard.app.server  # Flask server
     try:
-        # Get the underlying Flask server for threaded mode
-        if args.threaded:
-            dashboard.app.run_server(debug=False, port=port, host=host, threaded=True)
-        else:
-            dashboard.run_server(debug=False)#, port=port, host=host)
+        dashboard.app.run_server(debug=False, port=port, host=host)
     except KeyboardInterrupt:
         print("\nDashboard stopped by user")
     except Exception as e:
