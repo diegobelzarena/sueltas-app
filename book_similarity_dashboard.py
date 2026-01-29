@@ -92,48 +92,59 @@ class BookSimilarityDashboard:
         print(f"✓ Dashboard initialized in {init_elapsed:.2f} seconds")
     
     def _load_or_create_cache(self, max_per_letter=3):
-        """Load images from pickle cache or create it if missing"""
+        """
+        Build per-book image cache pickle files if missing, and load global metadata (all_letters).
+        """
         import time
+        import pickle
+        import os
         start = time.time()
 
-        # Try loading from pickle first
-        if os.path.exists(self._cache_file):
+        # Check if per-book pickle files exist for all books
+        missing_books = []
+        for book in self.books:
+            book_pkl = f"images_{book}.pkl"
+            if not os.path.exists(book_pkl):
+                missing_books.append(book)
+
+        if missing_books:
+            print(f"Building per-book image caches for {len(missing_books)} books...")
+            # Build image cache for all books, but save per-book
+            self._build_image_cache(max_per_letter)  # This will fill self._image_cache and self._image_index
+            # Save per-book pickle files
+            per_book_dict = {}
+            for (book, font, letter), img_list in self._image_index.items():
+                if book not in per_book_dict:
+                    per_book_dict[book] = {}
+                per_book_dict[book][(font, letter)] = img_list
+            for book, data in per_book_dict.items():
+                book_pkl = f"images_{book}.pkl"
+                try:
+                    with open(book_pkl, 'wb') as f:
+                        pickle.dump(data, f)
+                    print(f"  ✓ Saved {book_pkl} ({len(data)} keys)")
+                except Exception as e:
+                    print(f"  ✗ Failed to save {book_pkl}: {e}")
+            # Save global metadata (all_letters) for fast startup
             try:
-                print(f"Loading image cache from {self._cache_file}...")
-                with open(self._cache_file, 'rb') as f:
-                    cache_data = pickle.load(f)
-                # New format: dict with all needed data
-                if isinstance(cache_data, dict) and 'image_cache' in cache_data:
-                    self._image_cache = cache_data['image_cache']
-                    self._image_index = cache_data.get('image_index', {})
-                    self._all_letters = cache_data.get('all_letters', [])
-                else:
-                    # Old format: just the image cache dict
-                    self._image_cache = cache_data
-                    self._build_index()
-                    self._all_letters = self._get_all_letters_from_index()
-                elapsed = time.time() - start
-                print(f"Loaded {len(self._image_cache)} images from cache in {elapsed:.2f} seconds")
-                return
+                meta = {'all_letters': self._all_letters}
+                with open('images_cache_meta.pkl', 'wb') as f:
+                    pickle.dump(meta, f)
+                print("  ✓ Saved images_cache_meta.pkl")
             except Exception as e:
-                print(f"Cache load failed: {e}, rebuilding...")
-
-        # Build cache from scratch
-        self._build_image_cache(max_per_letter)
-
-        # Save to pickle (new format: dict with all needed data)
-        try:
-            print(f"Saving cache to {self._cache_file}...")
-            cache_data = {
-                'image_cache': self._image_cache,
-                'image_index': self._image_index,
-                'all_letters': self._all_letters
-            }
-            with open(self._cache_file, 'wb') as f:
-                pickle.dump(cache_data, f)
-            print(f"Cache saved successfully")
-        except Exception as e:
-            print(f"Failed to save cache: {e}")
+                print(f"  ✗ Failed to save images_cache_meta.pkl: {e}")
+            elapsed = time.time() - start
+            print(f"Built and saved per-book caches in {elapsed:.2f} seconds")
+        else:
+            print("✓ All per-book image caches found. Loading metadata...")
+            # Load global metadata (all_letters)
+            try:
+                with open('images_cache_meta.pkl', 'rb') as f:
+                    meta = pickle.load(f)
+                self._all_letters = meta.get('all_letters', [])
+                print(f"  ✓ Loaded all_letters ({len(self._all_letters)}) from images_cache_meta.pkl")
+            except Exception as e:
+                print(f"  ✗ Failed to load images_cache_meta.pkl: {e}")
     
     def _build_index(self):
         """Build lookup index from cache for O(1) access by (book, font, letter)"""
@@ -1974,7 +1985,7 @@ class BookSimilarityDashboard:
                 
                 if not available_letters:
                     comparison_content.append(
-                        html.P(f"📂 No {font_type} letter images found for these books", 
+                        html.P(f"No {font_type} letter images found for these books", 
                                style={'textAlign': 'center', 'color': 'gray', 'marginTop': '30px'})
                     )
                 else:
@@ -1983,7 +1994,7 @@ class BookSimilarityDashboard:
                     
                     if not letters_to_show:
                         comparison_content.append(
-                            html.P("☝️ Select letters above to compare", 
+                            html.P("Select letters above to compare", 
                                    style={'textAlign': 'center', 'color': 'gray', 'marginTop': '30px'})
                         )
                     else:
@@ -2032,7 +2043,7 @@ class BookSimilarityDashboard:
                         
                         if letters_with_images == 0:
                             comparison_content.append(
-                                html.P(f"⚠️ Selected letters have no images for these books.", 
+                                html.P(f"Selected letters have no images for these books.", 
                                        style={'textAlign': 'center', 'color': 'orange', 'marginTop': '30px'})
                             )
                 
@@ -2054,18 +2065,48 @@ class BookSimilarityDashboard:
                 ])
     
     def _get_cached_images(self, book_name, letter, font_type):
-        """Get all cached images for a book/letter/font combo - O(1) lookup"""
+        """
+        Get all cached images for a book/letter/font combo.
+        Loads per-book pickle file on demand if not already loaded.
+        """
+        # Per-book image cache: {book_name: {(font_type, letter): [(img_path, encoded), ...]}}
+        if not hasattr(self, '_per_book_image_cache'):
+            self._per_book_image_cache = {}
+
+        # Load book's images if not already loaded
+        if book_name not in self._per_book_image_cache:
+            self._load_book_images(book_name)
+
+        book_cache = self._per_book_image_cache.get(book_name, {})
         results = []
-        
-        # Determine font types to search
         font_types = ['roman', 'italic'] if font_type == 'combined' else [font_type]
-        
         for ft in font_types:
-            key = (book_name, ft, letter)
-            if key in self._image_index:
-                results.extend(self._image_index[key])
-        
+            key = (ft, letter)
+            if key in book_cache:
+                results.extend(book_cache[key])
         return results
+
+    def _load_book_images(self, book_name):
+        """
+        Load all images for a book from its pickle file into the per-book cache.
+        Pickle file should be named images_{book_name}.pkl in the working directory.
+        """
+        import pickle
+        import os
+        if not hasattr(self, '_per_book_image_cache'):
+            self._per_book_image_cache = {}
+        filename = f"images_{book_name}.pkl"
+        if not os.path.exists(filename):
+            # No pickle file for this book
+            self._per_book_image_cache[book_name] = {}
+            return
+        try:
+            with open(filename, 'rb') as f:
+                # Should be a dict: {(font_type, letter): [(img_path, encoded), ...]}
+                self._per_book_image_cache[book_name] = pickle.load(f)
+        except Exception as e:
+            print(f"Failed to load image pickle for {book_name}: {e}")
+            self._per_book_image_cache[book_name] = {}
     
     def _encode_image(self, image_path):
         """Get image from cache or load if not cached"""
