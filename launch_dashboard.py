@@ -49,8 +49,15 @@ def load_figures_cache():
     try:
         with open(FIGURES_CACHE_FILE, 'rb') as f:
             cache_data = pickle.load(f)
-        print(f"✓ Loaded figures from cache (saved: {cache_data.get('cached_at', 'unknown')})")
-        return cache_data.get('figures')
+        version = cache_data.get('version', '1.0')
+        if version >= '1.2':
+            # New format: 'data' contains essential data
+            figures_cache = cache_data.get('data')
+        else:
+            # Old format: 'figures' contains full figures
+            figures_cache = cache_data.get('figures')
+        print(f"✓ Loaded figures from cache (version: {version}, saved: {cache_data.get('cached_at', 'unknown')})")
+        return figures_cache
     except Exception as e:
         print(f"⚠ Figures cache load failed: {e}")
         return None

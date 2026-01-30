@@ -13,6 +13,7 @@ import os
 import glob
 import pickle
 from datetime import datetime
+import time
 
 try:
     import umap
@@ -43,10 +44,9 @@ class BookSimilarityDashboard:
         self.books = books
         self.w_rm = w_rm
         self.w_it = w_it
-        self.w_combined = (w_rm + w_it) / 2
         self.n1hat_rm = n1hat_rm
         self.n1hat_it = n1hat_it
-        self.n1hat_combined = n1hat_rm + n1hat_it
+        self.G = None  # NetworkX graph, initialized later
         self.impr_names = impr_names if impr_names is not None else np.array([f"Unknown_{i}" for i in range(len(books))])
         self.symbs = symbs if symbs is not None else np.array([f"symbol_{i}" for i in range(w_rm.shape[0] if len(w_rm.shape) > 2 else 26)])
         
@@ -59,13 +59,14 @@ class BookSimilarityDashboard:
             self.idxs_order = cached_order
         else:
             print("Computing hierarchical ordering...")
-            metric = 1 - self.w_combined
+            metric = 1 - (self.w_rm + self.w_it) / 2
             self.idxs_order = self._hierarchical_order(metric)
         
         # Pre-compute figures cache
         self._figures_cache = figures_cache if figures_cache else {}
         self._figures_cache_file = './dashboard_figures_cache.pkl'
         self._precompute_figures()
+        
         
         # Save figures cache to disk for next startup
         self._save_figures_cache()
@@ -77,12 +78,13 @@ class BookSimilarityDashboard:
         
         # Serve images from static folder
         self.letter_images_path = './letter_images/'
-        self._cache_file = './letter_images_cache.pkl'
-        
-        # Image cache - load from pickle or preload
-        self._image_cache = {}  # path -> encoded
+        self._cache_dir = './images_cache/'  # Directory for per-book cache files
+        os.makedirs(self._cache_dir, exist_ok=True)
+
+        # Image cache - per-book
+        self._image_cache = {}  # path -> encoded (used temporarily during cache build)
         self._image_index = {}  # (book, font, letter) -> [(path, encoded), ...]
-        self._load_or_create_cache(max_per_letter=3)  # 3 images per letter
+        self._load_or_create_per_book_files(max_per_letter=3)  # 3 images per letter
         
         self._setup_layout()
         self._setup_callbacks()
@@ -91,112 +93,37 @@ class BookSimilarityDashboard:
         init_elapsed = time.time() - init_start
         print(f"✓ Dashboard initialized in {init_elapsed:.2f} seconds")
     
-    def _load_or_create_cache(self, max_per_letter=3):
+    def _load_or_create_per_book_files(self, max_per_letter=3):
         """
-        Build per-book image cache pickle files if missing, and load global metadata (all_letters).
+        Build per-book image pickle files if missing, and load global metadata (all_letters).
         """
-        import time
-        import pickle
-        import os
         start = time.time()
 
         # Check if per-book pickle files exist for all books
         missing_books = []
         for book in self.books:
-            book_pkl = f"images_{book}.pkl"
+            book_pkl = f"{self._cache_dir}/images_{book}.pkl"
             if not os.path.exists(book_pkl):
                 missing_books.append(book)
 
         if missing_books:
-            print(f"Building per-book image caches for {len(missing_books)} books...")
-            # Build image cache for all books, but save per-book
-            self._build_image_cache(max_per_letter)  # This will fill self._image_cache and self._image_index
-            # Save per-book pickle files
-            per_book_dict = {}
-            for (book, font, letter), img_list in self._image_index.items():
-                if book not in per_book_dict:
-                    per_book_dict[book] = {}
-                per_book_dict[book][(font, letter)] = img_list
-            for book, data in per_book_dict.items():
-                book_pkl = f"images_{book}.pkl"
-                try:
-                    with open(book_pkl, 'wb') as f:
-                        pickle.dump(data, f)
-                    print(f"  ✓ Saved {book_pkl} ({len(data)} keys)")
-                except Exception as e:
-                    print(f"  ✗ Failed to save {book_pkl}: {e}")
-            # Save global metadata (all_letters) for fast startup
-            try:
-                meta = {'all_letters': self._all_letters}
-                with open('images_cache_meta.pkl', 'wb') as f:
-                    pickle.dump(meta, f)
-                print("  ✓ Saved images_cache_meta.pkl")
-            except Exception as e:
-                print(f"  ✗ Failed to save images_cache_meta.pkl: {e}")
-            elapsed = time.time() - start
-            print(f"Built and saved per-book caches in {elapsed:.2f} seconds")
+            print(f"Building per-book image pickle files for {len(missing_books)} books...")
+            # Build image per-book files
+            self._build_image_cache(max_per_letter)
         else:
             print("✓ All per-book image caches found. Loading metadata...")
-            # Load global metadata (all_letters)
+            # Load general metadata (book_index, etc.)
             try:
-                with open('images_cache_meta.pkl', 'rb') as f:
-                    meta = pickle.load(f)
-                self._all_letters = meta.get('all_letters', [])
-                print(f"  ✓ Loaded all_letters ({len(self._all_letters)}) from images_cache_meta.pkl")
+                with open(f'{self._cache_dir}/images_cache_meta.pkl', 'rb') as f:
+                    self.meta = pickle.load(f)
+                self._all_letters = self.meta.get('all_letters', [])
+                print(f"  ✓ Loaded metadata from images_cache_meta.pkl ({len(self._all_letters)} letters)")
             except Exception as e:
                 print(f"  ✗ Failed to load images_cache_meta.pkl: {e}")
     
-    def _build_index(self):
-        """Build lookup index from cache for O(1) access by (book, font, letter)"""
-        import time
-        start = time.time()
-        self._image_index = {}
         
-        for img_path, encoded in self._image_cache.items():
-            filename = os.path.basename(img_path)
-            parts = filename.split('_')
-            # Format: bookname_font_letter_number.png
-            # New format: bookname_font_upper-A_number.png or bookname_font_lower-a_number.png
-            # bookname can have underscores, so we need to find font/letter from the end
-            if len(parts) >= 4:
-                number = parts[-1].split('.')[0]  # e.g., "1"
-                letter_part = parts[-2]  # e.g., "A" or "upper-A" or "lower-a"
-                font = parts[-3]  # e.g., "roman"
-                book = '_'.join(parts[:-3])  # everything before font
-                
-                # Handle case-safe format (upper-A, lower-a)
-                if letter_part.startswith('upper-'):
-                    letter = letter_part[6:]  # Remove 'upper-'
-                elif letter_part.startswith('lower-'):
-                    letter = letter_part[6:]  # Remove 'lower-'
-                else:
-                    # Old format - letter is just the character
-                    letter = letter_part
-                
-                key = (book, font, letter)
-                if key not in self._image_index:
-                    self._image_index[key] = []
-                self._image_index[key].append((img_path, encoded, int(number) if number.isdigit() else 0))
-        
-        # Sort each list by image number
-        for key in self._image_index:
-            self._image_index[key].sort(key=lambda x: x[2])
-            # Remove the number from tuples (keep just path, encoded)
-            self._image_index[key] = [(p, e) for p, e, n in self._image_index[key]]
-        
-        elapsed = time.time() - start
-        print(f"Built index with {len(self._image_index)} (book,font,letter) keys in {elapsed:.2f}s")
-    
-    def _get_all_letters_from_index(self):
-        """Get all unique letters from the index"""
-        letters = set()
-        for (book, font, letter) in self._image_index.keys():
-            letters.add(letter)
-        # Sort: uppercase first, then lowercase, then accented
-        return sorted(list(letters), key=lambda x: (not x.isupper(), x.lower(), x))
-    
     def _build_image_cache(self, max_per_letter=3):
-        """Build image cache from letter_images folder"""
+        """Build per-book image pickle files from letter_images folder"""
         import time
         from concurrent.futures import ThreadPoolExecutor
         start = time.time()
@@ -220,36 +147,78 @@ class BookSimilarityDashboard:
                     grouped[key] = []
                 grouped[key].append(img_path)
         
-        # Collect paths to load
-        paths_to_load = []
-        for key, paths in grouped.items():
-            paths_to_load.extend(sorted(paths)[:max_per_letter])
-        
-        print(f"Loading {len(paths_to_load)} images...")
-        
-        # Parallel loading with ThreadPoolExecutor
-        def load_image(img_path):
+        # Build per-book image cache and metadata
+        # Group images by book, font, letter
+        book_index = {}
+        book_img_dict = {}
+        for img_path in all_images:
+            filename = os.path.basename(img_path)
+            parts = filename.split('_')
+            if len(parts) >= 4:
+                number = parts[-1].split('.')[0]
+                letter_part = parts[-2]
+                font = parts[-3]
+                book = '_'.join(parts[:-3])
+                # Handle case-safe format
+                if letter_part.startswith('upper-'):
+                    letter = letter_part[6:]
+                elif letter_part.startswith('lower-'):
+                    letter = letter_part[6:]
+                else:
+                    letter = letter_part
+                # Build book_img_dict for limiting per letter
+                key = (book, font, letter)
+                if key not in book_img_dict:
+                    book_img_dict[key] = []
+                book_img_dict[key].append(img_path)
+        # For each book, collect images, encode, and save pickle
+        books = set([k[0] for k in book_img_dict.keys()])
+        all_letters = set()
+        for book in books:
+            book_data = {}
+            available = set()
+            # For each (font, letter) in this book
+            for (b, font, letter), paths in book_img_dict.items():
+                if b != book:
+                    continue
+                # Limit to max_per_letter
+                selected_paths = sorted(paths)[:max_per_letter]
+                # Encode images
+                encoded_imgs = []
+                for img_path in selected_paths:
+                    try:
+                        with open(img_path, 'rb') as f:
+                            encoded = base64.b64encode(f.read()).decode()
+                        encoded_imgs.append((img_path, encoded))
+                    except:
+                        continue
+                if encoded_imgs:
+                    book_data[(font, letter)] = encoded_imgs
+                    available.add((font, letter))
+                    all_letters.add(letter)
+            # Save pickle for this book
+            book_pkl = os.path.join(self._cache_dir, f"images_{book}.pkl")
             try:
-                with open(img_path, 'rb') as f:
-                    return img_path, base64.b64encode(f.read()).decode()
-            except:
-                return img_path, None
-        
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            results = list(executor.map(load_image, paths_to_load))
-        
-        for img_path, encoded in results:
-            if encoded:
-                self._image_cache[img_path] = encoded
-        
+                with open(book_pkl, 'wb') as f:
+                    pickle.dump(book_data, f)
+                print(f"  ✓ Saved {book_pkl} ({len(book_data)} keys)")
+            except Exception as e:
+                print(f"  ✗ Failed to save {book_pkl}: {e}")
+            # Save available (font, letter) for metadata
+            book_index[book] = sorted(list(available))
+        # Save all unique letters with at least one image
+        self._all_letters = sorted(all_letters, key=lambda x: (not x.isupper(), x.lower(), x))
+        # Save general metadata file
+        self.meta = {'book_index': book_index, 'all_letters': self._all_letters}
+        meta_file = os.path.join(self._cache_dir, 'images_cache_meta.pkl')
+        try:
+            with open(meta_file, 'wb') as f:
+                pickle.dump(self.meta, f)
+            print(f"  ✓ Saved {meta_file} (metadata for {len(book_index)} books, {len(self._all_letters)} letters)")
+        except Exception as e:
+            print(f"  ✗ Failed to save {meta_file}: {e}")
         elapsed = time.time() - start
-        print(f"Built cache with {len(self._image_cache)} images in {elapsed:.2f} seconds")
-        
-        # Build index for fast lookups
-        self._build_index()
-        
-        # Get all unique letters from the index for the filter
-        self._all_letters = self._get_all_letters_from_index()
+        print(f"Built and saved per-book caches and metadata in {elapsed:.2f} seconds")
     
     def _hierarchical_order(self, distance_matrix):
         """Create hierarchical ordering of books"""
@@ -281,86 +250,54 @@ class BookSimilarityDashboard:
             return np.arange(len(distance_matrix))
     
     def _precompute_figures(self):
-        """Pre-compute heatmaps and network graphs for all font types"""
+        """Pre-compute and cache essential data for heatmaps and network graphs."""
         import time
+
+# Check if essential data or figures are already cached (support old and new formats)
+        cached_available = (
+            ('umap_positions_15_0.5' in self._figures_cache)
+            )
         
-        # Check if figures are already cached
-        required_keys = [
-            'heatmap_combined', 'heatmap_roman', 'heatmap_italic',
-            'network_combined_0.1_spring', 'network_roman_0.1_spring', 'network_italic_0.1_spring'
-        ]
-        
-        if all(key in self._figures_cache for key in required_keys):
-            print("✓ Using cached figures (heatmaps + networks)")
+        if cached_available:
+            print("✓ Using cached figures/data (heatmaps + networks)")
             return
-        
-        print("Pre-computing figures...")
+
+        print("Pre-computing essential data...")
         start = time.time()
-        
-        # Pre-compute heatmaps for all font types
-        if 'heatmap_combined' not in self._figures_cache:
-            print("  - Computing combined heatmap...")
-            self._figures_cache['heatmap_combined'] = self._create_heatmap(
-                self.w_combined, self.n1hat_combined, "Book Similarity Matrix (Combined)", reorder=True
-            )
-        
-        if 'heatmap_roman' not in self._figures_cache:
-            print("  - Computing roman heatmap...")
-            self._figures_cache['heatmap_roman'] = self._create_heatmap(
-                self.w_rm, self.n1hat_rm, "Book Similarity Matrix (Roman)", reorder=True
-            )
-        
-        if 'heatmap_italic' not in self._figures_cache:
-            print("  - Computing italic heatmap...")
-            self._figures_cache['heatmap_italic'] = self._create_heatmap(
-                self.w_it, self.n1hat_it, "Book Similarity Matrix (Italic)", reorder=True
-            )
-        
-        # Pre-compute UMAP positions for default settings (cached for fast startup)
-        # Use parameter-based key for consistency with recalculate_umap
-        default_n_neighbors = 15
-        default_min_dist = 0.5
-        umap_cache_key = f'umap_positions_{default_n_neighbors}_{default_min_dist}'
-        
-        if umap_cache_key not in self._figures_cache:
-            print(f"  - Computing default UMAP positions (n_neighbors={default_n_neighbors}, min_dist={default_min_dist})...")
-            distance_matrix = 1 - self.w_combined
-            np.fill_diagonal(distance_matrix, 0)
-            umap_positions = self._compute_umap_positions(distance_matrix, n_neighbors=default_n_neighbors, min_dist=default_min_dist)
-            if umap_positions is not None:
-                self._figures_cache[umap_cache_key] = umap_positions
-        
-        # Pre-compute network graphs for default settings (threshold=0.1, layout=umap)
+
+        # Cache network graph data (adjacency matrix + positions)
         default_threshold = 0.1
         default_layout = 'umap'
-        
-        # Get cached UMAP positions
-        umap_positions = self._figures_cache.get(umap_cache_key)
-        
-        if f'network_combined_{default_threshold}_{default_layout}' not in self._figures_cache:
-            print("  - Computing combined network graph (UMAP)...")
-            fig, pos = self._create_network_graph(self.w_combined, default_threshold, default_layout, 
-                                                   umap_positions=umap_positions)
-            self._figures_cache[f'network_combined_{default_threshold}_{default_layout}'] = fig
-            self._figures_cache[f'network_pos_combined_{default_threshold}_{default_layout}'] = pos
-        
-        if f'network_roman_{default_threshold}_{default_layout}' not in self._figures_cache:
-            print("  - Computing roman network graph (UMAP)...")
-            fig, pos = self._create_network_graph(self.w_rm, default_threshold, default_layout,
-                                                   umap_positions=umap_positions)
-            self._figures_cache[f'network_roman_{default_threshold}_{default_layout}'] = fig
-            self._figures_cache[f'network_pos_roman_{default_threshold}_{default_layout}'] = pos
-        
-        if f'network_italic_{default_threshold}_{default_layout}' not in self._figures_cache:
-            print("  - Computing italic network graph (UMAP)...")
-            fig, pos = self._create_network_graph(self.w_it, default_threshold, default_layout,
-                                                   umap_positions=umap_positions)
-            self._figures_cache[f'network_italic_{default_threshold}_{default_layout}'] = fig
-            self._figures_cache[f'network_pos_italic_{default_threshold}_{default_layout}'] = pos
-        
+        umap_positions = self._compute_umap_positions(1 - (self.w_rm + self.w_it) / 2)  # Default UMAP positions
+
+        if 'umap_positions_15_0.5' not in self._figures_cache:
+            print("  - Caching combined network data...")
+            self._figures_cache['umap_positions_15_0.5'] = umap_positions
+            
         elapsed = time.time() - start
-        print(f"✓ Figures computed in {elapsed:.2f} seconds")
-        print(f"  Cache keys: {list(self._figures_cache.keys())}")
+        print(f"✓ Essential data cached in {elapsed:.2f} seconds")
+    
+    def _rebuild_heatmap(self, font_type, title):
+        """Rebuild a heatmap figure from cached data."""
+        if font_type == 'combined':
+            matrix = (self.w_rm + self.w_it) / 2
+            n1hat = self.n1hat_rm + self.n1hat_it
+        elif font_type == 'roman':
+            matrix = self.w_rm
+            n1hat = self.n1hat_rm
+        else:
+            matrix = self.w_it
+            n1hat = self.n1hat_it
+
+        # Apply hierarchical ordering
+        order = self.idxs_order        
+        # Apply the hierarchical order
+        ordered_matrix = matrix[np.ix_(order, order)]
+        ordered_n1hat = n1hat[np.ix_(order, order)] if n1hat is not None else None
+        
+        # Use the existing _create_heatmap method with ordered data
+        return self._create_heatmap(ordered_matrix, ordered_n1hat, title, reorder=False)
+
     
     def _save_figures_cache(self):
         """Save figures cache to disk"""
@@ -368,9 +305,9 @@ class BookSimilarityDashboard:
         from datetime import datetime
         try:
             cache_data = {
-                'figures': self._figures_cache,
+                'data': self._figures_cache,  # Now contains essential data, not full figures
                 'cached_at': datetime.now().isoformat(),
-                'version': '1.1'
+                'version': '1.2'
             }
             with open(self._figures_cache_file, 'wb') as f:
                 pickle.dump(cache_data, f)
@@ -388,42 +325,12 @@ class BookSimilarityDashboard:
         return None
     
     def _get_cached_heatmap(self, font_type):
-        """Get cached heatmap or compute on demand"""
-        key = f'heatmap_{font_type}'
-        if key in self._figures_cache:
-            return self._figures_cache[key]
+        """Get heatmap by rebuilding from cached data or return cached figure"""
         
-        # Compute on demand if not cached
-        if font_type == 'combined':
-            matrix, title = self.w_combined, "Book Similarity Matrix (Combined)"
-        elif font_type == 'roman':
-            matrix, title = self.w_rm, "Book Similarity Matrix (Roman)"
-        else:
-            matrix, title = self.w_it, "Book Similarity Matrix (Italic)"
-        
-        fig = self._create_heatmap(matrix, title, reorder=True)
-        self._figures_cache[key] = fig
-        return fig
-    
-    def _get_cached_network(self, font_type, threshold, layout, marker_size=12, label_size=8):
-        """Get cached network graph or compute on demand"""
-        key = f'network_{font_type}_{threshold}_{layout}'
-        if key in self._figures_cache:
-            return self._figures_cache[key], self._figures_cache.get(f'network_pos_{font_type}_{threshold}_{layout}', {})
-        
-        # Compute on demand if not cached
-        if font_type == 'combined':
-            matrix = self.w_combined
-        elif font_type == 'roman':
-            matrix = self.w_rm
-        else:
-            matrix = self.w_it
-        
-        fig, pos = self._create_network_graph(matrix, threshold, layout, marker_size=marker_size, label_size=label_size)
-        self._figures_cache[key] = fig
-        self._figures_cache[f'network_pos_{key}'] = pos
-        return fig, pos
+        title = f"Book Similarity Matrix ({font_type.capitalize()})"
+        return self._rebuild_heatmap(font_type, title)
 
+    
     def _compute_umap_positions(self, distance_matrix, n_neighbors=15, min_dist=0.5, random_state=42):
         """Compute UMAP positions from distance matrix"""
         if not UMAP_AVAILABLE:
@@ -473,18 +380,15 @@ class BookSimilarityDashboard:
                          n_neighbors=15, min_dist=0.5, umap_positions=None, edge_opacity=0.3, n1hat_matrix=None,
                          marker_size=12, label_size=8):
         """Create network graph from weight matrix with UMAP positioning and printer colors"""
-        # Filter by threshold
-        edges = []
-        edge_weights = []
-        edge_n1hats = []  # Store n1hat values for hover
         
-        for i in range(len(self.books)):
-            for j in range(i + 1, len(self.books)):
-                if weight_matrix[i, j] > threshold:
-                    edges.append((i, j))
-                    edge_weights.append(weight_matrix[i, j])
-                    if n1hat_matrix is not None:
-                        edge_n1hats.append(n1hat_matrix[i, j])
+        # Filter by threshold (vectorized for performance)
+        mask = weight_matrix > threshold
+        upper_mask = np.triu(mask, k=1)  # Upper triangle, exclude diagonal
+        i_indices, j_indices = np.where(upper_mask)
+        edges = list(zip(i_indices, j_indices))
+        edge_weights = weight_matrix[upper_mask]
+        
+        edges_array = np.array(edges)  # For vectorized operations
         
         if not edges:
             print(f"Warning: No edges found with threshold {threshold}. Max similarity: {np.max(weight_matrix):.4f}")
@@ -496,12 +400,12 @@ class BookSimilarityDashboard:
                 showarrow=False, font=dict(size=16)
             )
             fig.update_layout(title="No Network Connections Found")
-            return fig, None
+            return fig
         
         # Create NetworkX graph
-        G = nx.Graph()
-        G.add_nodes_from(range(len(self.books)))
-        G.add_weighted_edges_from([(i, j, w) for (i, j), w in zip(edges, edge_weights)])
+        self.G = nx.Graph()
+        self.G.add_nodes_from(range(len(self.books)))
+        self.G.add_weighted_edges_from([(i, j, w) for (i, j), w in zip(edges, edge_weights)])
         
         # Calculate layout positions
         if layout_type == 'umap' and UMAP_AVAILABLE:
@@ -510,45 +414,40 @@ class BookSimilarityDashboard:
                 pos = {i: umap_positions[i] for i in range(len(self.books))}
             else:
                 # Compute UMAP positions from distance matrix
-                distance_matrix = 1 - self.w_combined  # Convert similarity to distance
+                distance_matrix = 1 - (self.w_rm + self.w_it) / 2  # Convert similarity to distance
                 np.fill_diagonal(distance_matrix, 0)
+                print("Computing UMAP positions for network layout...", umap_positions)
                 positions = self._compute_umap_positions(distance_matrix, n_neighbors, min_dist)
                 if positions is not None:
                     pos = {i: positions[i] for i in range(len(self.books))}
                 else:
-                    pos = nx.spring_layout(G, k=2, iterations=50)
+                    pos = nx.spring_layout(self.G, k=2, iterations=50)
         elif layout_type == 'spring':
-            pos = nx.spring_layout(G, k=2, iterations=50)
+            pos = nx.spring_layout(self.G, k=2, iterations=50)
         elif layout_type == 'circular':
-            pos = nx.circular_layout(G)
+            pos = nx.circular_layout(self.G)
         else:
-            pos = nx.spring_layout(G, k=2, iterations=50)
+            pos = nx.spring_layout(self.G, k=2, iterations=50)
         
         # Get printer colors and markers (matching heatmap)
         impr_to_color, impr_to_marker, unique_imprs = self._get_printer_colors()
+        
+        # Convert pos to array for vectorized operations
+        pos_array = np.array([pos[i] for i in range(len(pos))])
+        impr_array = np.array(self.impr_names)
         
         # Create figure
         fig = go.Figure()
         
         # Add ALL edges as a SINGLE trace using None separators (much faster for legend interactions)
         # This dramatically reduces the number of traces from hundreds to just one
-        max_weight = max(edge_weights) if edge_weights else 1
-        edge_x = []
-        edge_y = []
-        edge_text = []  # Hover text for edges
-        for idx, ((i, j), weight) in enumerate(zip(edges, edge_weights)):
-            x0, y0 = pos[i]
-            x1, y1 = pos[j]
-            edge_x.extend([x0, x1, None])  # None creates a break between segments
-            edge_y.extend([y0, y1, None])
-            
-            # # Create hover text with n1hat if available
-            # if n1hat_matrix is not None and idx < len(edge_n1hats):
-            #     hover = f"{self.books[i]} ↔ {self.books[j]}<br>Weight: {weight:.3f}<br>n1hat: {int(edge_n1hats[idx])}"
-            # else:
-            #     hover = f"{self.books[i]} ↔ {self.books[j]}<br>Weight: {weight:.3f}"
-            # # Add hover text for start, end, and None separator
-            # edge_text.extend([hover, hover, None])
+        x0 = pos_array[edges_array[:, 0], 0]
+        x1 = pos_array[edges_array[:, 1], 0]
+        y0 = pos_array[edges_array[:, 0], 1]
+        y1 = pos_array[edges_array[:, 1], 1]
+        edge_x = np.concatenate([x0, x1, np.full(len(x0), None, dtype=object)]).tolist()
+        edge_y = np.concatenate([y0, y1, np.full(len(y0), None, dtype=object)]).tolist()
+        edge_text = []
         
         # Single edge trace with uniform opacity (controlled by slider)
         fig.add_trace(go.Scatter(
@@ -564,13 +463,13 @@ class BookSimilarityDashboard:
         # Add nodes colored by printer, one trace per printer for legend
         # Using same colors and markers as heatmap diagonal
         for impr in unique_imprs:
-            node_indices = [i for i in range(len(self.books)) if self.impr_names[i] == impr]
-            if not node_indices:
+            node_indices = np.where(impr_array == impr)[0]
+            if len(node_indices) == 0:
                 continue
             
-            node_x = [pos[i][0] for i in node_indices]
-            node_y = [pos[i][1] for i in node_indices]
-            node_text = [f"{self.books[i]}<br>Printer: {self.impr_names[i]}<br>Connections: {G.degree(i)}" 
+            node_x = pos_array[node_indices, 0].tolist()
+            node_y = pos_array[node_indices, 1].tolist()
+            node_text = [f"{self.books[i]}<br>Printer: {self.impr_names[i]}<br>Connections: {self.G.degree(i)}" 
                         for i in node_indices]
             # Show printer name as label on top of nodes
             node_labels = [impr for _ in node_indices]
@@ -595,12 +494,12 @@ class BookSimilarityDashboard:
             ))
         
         # Add nodes for unknown/missing printers with 0.5 alpha and no label
-        unknown_indices = [i for i in range(len(self.books)) 
-                          if self.impr_names[i] in ['n. nan', 'm. missing', 'Unknown']]
-        if unknown_indices:
-            node_x = [pos[i][0] for i in unknown_indices]
-            node_y = [pos[i][1] for i in unknown_indices]
-            node_text = [f"{self.books[i]}<br>Printer: Unknown<br>Connections: {G.degree(i)}" 
+        unknown_mask = np.isin(impr_array, ['n. nan', 'm. missing', 'Unknown'])
+        unknown_indices = np.where(unknown_mask)[0]
+        if len(unknown_indices) > 0:
+            node_x = pos_array[unknown_indices, 0].tolist()
+            node_y = pos_array[unknown_indices, 1].tolist()
+            node_text = [f"{self.books[i]}<br>Printer: Unknown<br>Connections: {self.G.degree(i)}" 
                         for i in unknown_indices]
             # No label for unknown/missing printers
             node_labels = ['' for _ in unknown_indices]
@@ -652,73 +551,83 @@ class BookSimilarityDashboard:
             paper_bgcolor='white'
         )
         
-        # Store UMAP positions for caching
-        umap_pos_array = np.array([[pos[i][0], pos[i][1]] for i in range(len(self.books))]) if pos else None
-        
-        return fig, umap_pos_array
+        return fig
     
     def _get_available_letters_for_books(self, book1, book2, font_type='roman', letter_images_path='./letter_images/'):
-        """Get list of letters that have images available for either of the two specified books using the index."""
+        """Get list of letters that have images available for either of the two specified books using the metadata index."""
         letters = set()
         if font_type == 'combined':
             font_types_to_search = ['roman', 'italic']
         else:
             font_types_to_search = [font_type]
 
-        for (b, ft, letter) in self._image_index.keys():
-            if (b == book1 or b == book2) and ft in font_types_to_search:
-                letters.add(letter)
+        # Use self.meta['book_index'] to get available (font, letter) pairs for each book
+        for book in [book1, book2]:
+            available = self.meta.get('book_index', {}).get(book, [])
+            for font, letter in available:
+                if font in font_types_to_search:
+                    letters.add(letter)
 
         result = sorted(list(letters))
         print(f"DEBUG: Found letters for {book1} and {book2}: {result}")
         return result
     
     def _get_available_letters_for_single_book(self, book, font_type='roman'):
-        """Get list of letters that have images available for a single book."""
+        """Get list of letters that have images available for a single book using the metadata index."""
         letters = set()
-        
-        # Determine which font types to search for
         if font_type == 'combined':
             font_types_to_search = ['roman', 'italic']
         else:
             font_types_to_search = [font_type]
-        
-        # Look up in the index for efficiency
-        for (b, ft, letter) in self._image_index.keys():
-            if b == book and ft in font_types_to_search:
+
+        available = self.meta.get('book_index', {}).get(book, [])
+        for font, letter in available:
+            if font in font_types_to_search:
                 letters.add(letter)
-        
+
         return sorted(list(letters))
     
-    def _get_available_images(self, book_name, letter, font_type='roman', letter_images_path='./letter_images/'):
-        """Get available image paths for a specific book, letter, and font type."""
-        if not os.path.exists(letter_images_path):
-            return []
+    def _get_available_images(self, book_name, letter, font_type='roman'):
+        """Get available encoded images for a specific book, letter, and font type from the per-book pickle cache."""
         
         # Determine which font types to search for
         if font_type == 'combined':
             font_types_to_search = ['roman', 'italic']
         else:
             font_types_to_search = [font_type]
-        
-        image_paths = []
+
+        book_pkl = os.path.join(self._cache_dir, f"images_{book_name}.pkl")
+        if not os.path.exists(book_pkl):
+            print(f"Warning: Cache file not found for book {book_name}: {book_pkl}")
+            return []
+
+        try:
+            with open(book_pkl, 'rb') as f:
+                book_data = pickle.load(f)
+        except Exception as e:
+            print(f"Warning: Failed to load cache for {book_name}: {e}")
+            return []
+
+        images = []
         for ft in font_types_to_search:
-            # Find all images for this book-letter-font combination
-            pattern = os.path.join(letter_images_path, f"{book_name}_{ft}_{letter}_*.png")
-            image_paths.extend(glob.glob(pattern))
-        
-        # Sort by image number
-        def extract_number(path):
+            key = (ft, letter)
+            if key in book_data:
+                images.extend(book_data[key])  # Each entry is (img_path, encoded)
+
+        # Optionally sort by image path number if needed
+        def extract_number(item):
+            path = item[0]
             filename = os.path.basename(path)
             try:
                 return int(filename.split('_')[-1].split('.')[0])
             except ValueError:
                 return 0
-        
-        return sorted(image_paths, key=extract_number)
+
+        return sorted(images, key=extract_number)
     
     def _create_heatmap(self, matrix, n1hat, title="Similarity Matrix", reorder=False):
         """Create similarity matrix heatmap matching notebook style"""
+        
         try:
             if reorder and hasattr(self, 'idxs_order') and self.idxs_order is not None:
                 # Ensure idxs_order is 1D and contains valid indices
@@ -769,18 +678,17 @@ class BookSimilarityDashboard:
         n_books = len(labels)
         
         # Create the main heatmap
-        # Prepare customdata: for each cell, [impr_y, impr_x]
-        customdata = np.empty((len(labels), len(labels), 2), dtype=object)
-        for i in range(len(labels)):
-            for j in range(len(labels)):
-                if ordered_impr[i] in ['n. nan', 'm. missing']:
-                    customdata[i, j, 0] = ''
-                else:
-                    customdata[i, j, 0] = ordered_impr[i] # y imprinter (row)
-                if ordered_impr[j] in ['n. nan', 'm. missing']:
-                    customdata[i, j, 1] = ''
-                else:
-                    customdata[i, j, 1] = ordered_impr[j]  # x imprinter (col)
+        # Prepare customdata: for each cell, [impr_y, impr_x] (vectorized)
+        if ordered_impr is not None:
+            impr_array = np.array(ordered_impr)
+            missing_mask = np.isin(impr_array, ['n. nan', 'm. missing'])
+            customdata = np.empty((len(labels), len(labels), 2), dtype=object)
+            # For rows (y): repeat for each column
+            customdata[:, :, 0] = np.where(missing_mask[:, None], '', impr_array[:, None])
+            # For columns (x): repeat for each row
+            customdata[:, :, 1] = np.where(missing_mask[None, :], '', impr_array[None, :])
+        else:
+            customdata = None
 
         fig = go.Figure(data=go.Heatmap(
             z=ordered_n1hat if ordered_n1hat is not None else ordered_matrix,
@@ -828,32 +736,12 @@ class BookSimilarityDashboard:
                     # Convert hex to rgba with alpha
                     rgba_color = f"rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, 0.3)"
                     
-                    for idx in indices:
-                        # Horizontal band (row overlay) for this book
-                        fig.add_shape(
-                            type="rect",
-                            x0=-0.5,
-                            x1=len(labels)-0.5,
-                            y0=idx-0.5,
-                            y1=idx+0.5,
-                            fillcolor=rgba_color,
-                            line_width=0,
-                            layer="above",
-                            name=f"overlay_{impr}"  # Tag shape with printer name
-                        )
-                        
-                        # Vertical band (column overlay) for this book
-                        fig.add_shape(
-                            type="rect",
-                            x0=idx-0.5,
-                            x1=idx+0.5,
-                            y0=-0.5,
-                            y1=len(labels)-0.5,
-                            fillcolor=rgba_color,
-                            line_width=0,
-                            layer="above",
-                            name=f"overlay_{impr}"  # Tag shape with printer name
-                        )
+                    # Skip overlays for performance - keep only diagonal markers
+                    # for idx in indices:
+                    #     # Horizontal band (row overlay) for this book
+                    #     fig.add_shape(...)
+                    #     # Vertical band (column overlay) for this book
+                    #     fig.add_shape(...)
             
             # Add diagonal markers as scatter traces (respond to legend clicks)
             for impr, indices in printer_indices.items():
@@ -1475,7 +1363,7 @@ class BookSimilarityDashboard:
             
             # Compute new UMAP positions
             print(f"Computing UMAP positions for n_neighbors={n_neighbors}, min_dist={min_dist}...")
-            distance_matrix = 1 - self.w_combined
+            distance_matrix = 1 - (self.w_rm + self.w_it) / 2  # Combined distance
             np.fill_diagonal(distance_matrix, 0)
             positions = self._compute_umap_positions(distance_matrix, n_neighbors, min_dist)
             
@@ -1560,7 +1448,7 @@ class BookSimilarityDashboard:
                 weight_matrix = self.w_it
                 title_suffix = " (Italic)"
             else:
-                weight_matrix = self.w_combined
+                weight_matrix = (self.w_rm + self.w_it) / 2
                 title_suffix = " (Combined)"
             umap_pos_array = None
             if umap_positions is not None and len(umap_positions) > 0:
@@ -1574,8 +1462,8 @@ class BookSimilarityDashboard:
             elif font_type == 'italic':
                 n1hat_matrix = self.n1hat_it
             else:
-                n1hat_matrix = None
-            network_fig, _ = self._create_network_graph(
+                n1hat_matrix = self.n1hat_rm + self.n1hat_it
+            network_fig = self._create_network_graph(
                 weight_matrix, threshold, layout,
                 n_neighbors=n_neighbors, min_dist=min_dist,
                 umap_positions=umap_pos_array, edge_opacity=edge_opacity,
@@ -1845,7 +1733,7 @@ class BookSimilarityDashboard:
                 elif font_type == 'italic':
                     weight_matrix = self.w_it
                 else:
-                    weight_matrix = self.w_combined
+                    weight_matrix = (self.w_rm + self.w_it) / 2
                 
                 network_data = {
                     'books': self.books.tolist(),
@@ -1868,7 +1756,7 @@ class BookSimilarityDashboard:
                 elif font_type == 'italic':
                     weight_matrix = self.w_it
                 else:
-                    weight_matrix = self.w_combined
+                    weight_matrix = (self.w_rm + self.w_it) / 2
                 
                 df = pd.DataFrame(weight_matrix, index=self.books, columns=self.books)
                 filename = f'similarity_matrix_{font_type}_{timestamp}.csv'
@@ -2001,21 +1889,21 @@ class BookSimilarityDashboard:
                         letters_with_images = 0
                         # Show filtered letters instantly from cache
                         for letter in letters_to_show:
-                            # Get images for all books
+                            # Get images for all books using the updated cache-aware function
                             all_book_images = []
                             has_any_images = False
                             for book in books_to_compare:
-                                images = self._get_cached_images(book, letter, font_type)
+                                images = self._get_available_images(book, letter, font_type)
                                 all_book_images.append(images)
                                 if images:
                                     has_any_images = True
-                            
+
                             # Skip if no book has images for this letter
                             if not has_any_images:
                                 continue
-                            
+
                             letters_with_images += 1
-                            
+
                             # Build image elements for each book
                             book_columns = []
                             for book_images in all_book_images:
@@ -2029,11 +1917,11 @@ class BookSimilarityDashboard:
                                     )
                                 if not img_elements:
                                     img_elements.append(html.Span("—", style={'color': '#999', 'fontSize': '24px'}))
-                                
+
                                 book_columns.append(
                                     html.Div(img_elements, style={'width': col_width, 'display': 'inline-block', 'textAlign': 'center', 'verticalAlign': 'middle'})
                                 )
-                            
+
                             comparison_content.append(
                                 html.Div([
                                     html.H5(f"'{letter}'", style={'marginBottom': '5px', 'textAlign': 'center', 'fontSize': '14px', 'fontWeight': 'bold'}),
