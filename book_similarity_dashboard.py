@@ -523,7 +523,7 @@ class BookSimilarityDashboard:
         return impr_to_color, impr_to_marker, unique_imprs
 
     def _create_network_graph(self, weight_matrix, threshold=0.1, layout_type='umap',
-                         n_neighbors=50, min_dist=0.5, umap_positions=None, edge_opacity=0.3, n1hat_matrix=None,
+                         n_neighbors=50, min_dist=0.5, umap_positions=None, edge_opacity=1.0, n1hat_matrix=None,
                          marker_size=12, label_size=8, font_type='combined'):
         """Create network graph from weight matrix with UMAP positioning and printer colors"""
         
@@ -1700,70 +1700,70 @@ class BookSimilarityDashboard:
                 
                 return network_fig, heatmap_fig, stats
         
-        # Toggle shape overlays when legend items are clicked
-        @self.app.callback(
-            Output('similarity-heatmap', 'figure', allow_duplicate=True),
-            [Input('similarity-heatmap', 'restyleData')],
-            [State('similarity-heatmap', 'figure')],
-            prevent_initial_call=True
-        )
-        def toggle_shape_overlays(restyle_data, current_fig):
-            if restyle_data is None or current_fig is None:
-                return dash.no_update
+        # # Toggle shape overlays when legend items are clicked
+        # @self.app.callback(
+        #     Output('similarity-heatmap', 'figure', allow_duplicate=True),
+        #     [Input('similarity-heatmap', 'restyleData')],
+        #     [State('similarity-heatmap', 'figure')],
+        #     prevent_initial_call=True
+        # )
+        # def toggle_shape_overlays(restyle_data, current_fig):
+        #     if restyle_data is None or current_fig is None:
+        #         return dash.no_update
             
-            # restyleData format: [{'visible': ['legendonly']}, [1]] means trace 1 was hidden
-            # or [{'visible': [True]}, [1]] means trace 1 was shown
-            try:
-                visibility_change = restyle_data[0].get('visible', None)
-                trace_indices = restyle_data[1] if len(restyle_data) > 1 else []
+        #     # restyleData format: [{'visible': ['legendonly']}, [1]] means trace 1 was hidden
+        #     # or [{'visible': [True]}, [1]] means trace 1 was shown
+        #     try:
+        #         visibility_change = restyle_data[0].get('visible', None)
+        #         trace_indices = restyle_data[1] if len(restyle_data) > 1 else []
                 
-                if visibility_change is None or not trace_indices:
-                    return dash.no_update
+        #         if visibility_change is None or not trace_indices:
+        #             return dash.no_update
                 
-                # Get the trace that was toggled
-                traces = current_fig.get('data', [])
-                shapes = current_fig.get('layout', {}).get('shapes', [])
+        #         # Get the trace that was toggled
+        #         traces = current_fig.get('data', [])
+        #         shapes = current_fig.get('layout', {}).get('shapes', [])
                 
-                if not shapes:
-                    return dash.no_update
+        #         if not shapes:
+        #             return dash.no_update
                 
-                # For each toggled trace, find its name (printer) and toggle corresponding shapes
-                for i, trace_idx in enumerate(trace_indices):
-                    if trace_idx < len(traces):
-                        trace = traces[trace_idx]
-                        printer_name = trace.get('name', '')
-                        new_visible = visibility_change[i] if i < len(visibility_change) else visibility_change[0]
+        #         # For each toggled trace, find its name (printer) and toggle corresponding shapes
+        #         for i, trace_idx in enumerate(trace_indices):
+        #             if trace_idx < len(traces):
+        #                 trace = traces[trace_idx]
+        #                 printer_name = trace.get('name', '')
+        #                 new_visible = visibility_change[i] if i < len(visibility_change) else visibility_change[0]
                         
-                        # Check if visible - handle various formats Plotly might send
-                        # 'legendonly' means hidden, anything else (True, true, 1) means visible
-                        is_visible = new_visible not in ['legendonly', False, 'false', None]
+        #                 # Check if visible - handle various formats Plotly might send
+        #                 # 'legendonly' means hidden, anything else (True, true, 1) means visible
+        #                 is_visible = new_visible not in ['legendonly', False, 'false', None]
                         
-                        # Update shapes that belong to this printer
-                        for shape in shapes:
-                            shape_name = shape.get('name', '')
-                            if shape_name == f"overlay_{printer_name}":
-                                # Toggle visibility by setting opacity (preserve RGB)
-                                current_fill = shape.get('fillcolor', '')
-                                if 'rgba' in current_fill:
-                                    parts = current_fill.replace('rgba(', '').replace(')', '').split(',')
-                                    if len(parts) >= 3:
-                                        if is_visible:
-                                            # Restore alpha to 0.3
-                                            shape['fillcolor'] = f"rgba({parts[0]},{parts[1]},{parts[2]}, 0.3)"
-                                        else:
-                                            # Set alpha to 0 (keep RGB for later restore)
-                                            shape['fillcolor'] = f"rgba({parts[0]},{parts[1]},{parts[2]}, 0)"
+        #                 # Update shapes that belong to this printer
+        #                 for shape in shapes:
+        #                     shape_name = shape.get('name', '')
+        #                     if shape_name == f"overlay_{printer_name}":
+        #                         # Toggle visibility by setting opacity (preserve RGB)
+        #                         current_fill = shape.get('fillcolor', '')
+        #                         if 'rgba' in current_fill:
+        #                             parts = current_fill.replace('rgba(', '').replace(')', '').split(',')
+        #                             if len(parts) >= 3:
+        #                                 if is_visible:
+        #                                     # Restore alpha to 0.3
+        #                                     shape['fillcolor'] = f"rgba({parts[0]},{parts[1]},{parts[2]}, 0.3)"
+        #                                 else:
+        #                                     # Set alpha to 0 (keep RGB for later restore)
+        #                                     shape['fillcolor'] = f"rgba({parts[0]},{parts[1]},{parts[2]}, 0)"
                 
-                # Explicitly preserve layout settings to prevent margin shifts
-                current_fig['layout']['uirevision'] = 'constant'
-                current_fig['layout']['xaxis']['automargin'] = False
-                current_fig['layout']['yaxis']['automargin'] = False
+        #         # Explicitly preserve layout settings to prevent margin shifts
+        #         current_fig['layout']['uirevision'] = 'constant'
+        #         current_fig['layout']['xaxis']['automargin'] = False
+        #         current_fig['layout']['yaxis']['automargin'] = False
                 
-                return current_fig
+        #         return current_fig
                 
-            except Exception as e:
-                print(f"Error toggling shapes: {e}")
-                return dash.no_update
+        #     except Exception as e:
+        #         print(f"Error toggling shapes: {e}")
+        #         return dash.no_update
         
         # Show/hide all printers in network graph legend
         @self.app.callback(
@@ -1823,20 +1823,20 @@ class BookSimilarityDashboard:
                         continue
                     trace['visible'] = True if show_all else 'legendonly'
                 
-                # Update all shape overlays
-                for shape in shapes:
-                    shape_name = shape.get('name', '')
-                    if shape_name.startswith('overlay_'):
-                        current_fill = shape.get('fillcolor', '')
-                        if 'rgba' in current_fill:
-                            parts = current_fill.replace('rgba(', '').replace(')', '').split(',')
-                            if len(parts) >= 3:
-                                if show_all:
-                                    # Restore alpha to 0.3
-                                    shape['fillcolor'] = f"rgba({parts[0]},{parts[1]},{parts[2]}, 0.3)"
-                                else:
-                                    # Set alpha to 0 (keep RGB for later restore)
-                                    shape['fillcolor'] = f"rgba({parts[0]},{parts[1]},{parts[2]}, 0)"
+                # # Update all shape overlays
+                # for shape in shapes:
+                #     shape_name = shape.get('name', '')
+                #     if shape_name.startswith('overlay_'):
+                #         current_fill = shape.get('fillcolor', '')
+                #         if 'rgba' in current_fill:
+                #             parts = current_fill.replace('rgba(', '').replace(')', '').split(',')
+                #             if len(parts) >= 3:
+                #                 if show_all:
+                #                     # Restore alpha to 0.3
+                #                     shape['fillcolor'] = f"rgba({parts[0]},{parts[1]},{parts[2]}, 0.3)"
+                #                 else:
+                #                     # Set alpha to 0 (keep RGB for later restore)
+                #                     shape['fillcolor'] = f"rgba({parts[0]},{parts[1]},{parts[2]}, 0)"
                 
                 # Explicitly preserve layout settings to prevent margin shifts
                 current_fig['layout']['uirevision'] = 'constant'
