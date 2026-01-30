@@ -253,6 +253,7 @@ class BookSimilarityDashboard:
             from scipy.cluster.hierarchy import leaves_list
             leaf_order = leaves_list(optimal_order)
             
+            print(f"Hierarchical order computed: {leaf_order}")  # Debugging print
             return leaf_order
         except Exception as e:
             print(f"Warning: Hierarchical ordering failed ({e}), using default order")
@@ -307,13 +308,15 @@ class BookSimilarityDashboard:
             n1hat = self.n1hat_it
 
         # Apply hierarchical ordering
-        order = self.idxs_order        
-        # Apply the hierarchical order
-        ordered_matrix = matrix[np.ix_(order, order)]
-        ordered_n1hat = n1hat[np.ix_(order, order)] if n1hat is not None else None
+        # order = self.idxs_order        
+        # print(f"Applying hierarchical order: {order}")  # Debugging print
+        # # Apply the hierarchical order
+        # ordered_matrix = matrix[np.ix_(order, order)]
+        # ordered_n1hat = n1hat[np.ix_(order, order)] if n1hat is not None else None
         
+        # print(f"Ordered matrix shape: {ordered_matrix.shape}")  # Debugging print
         # Use the existing _create_heatmap method with ordered data
-        return self._create_heatmap(ordered_matrix, ordered_n1hat, title, reorder=False)
+        return self._create_heatmap(matrix, n1hat, title, reorder=True)
 
     
     def _save_figures_cache(self):
@@ -716,6 +719,7 @@ class BookSimilarityDashboard:
                     ordered_books = self.books[self.idxs_order]
                     ordered_impr = self.impr_names[self.idxs_order] if self.impr_names is not None else None
                     ordered_n1hat = n1hat[np.ix_(self.idxs_order, self.idxs_order)] if n1hat is not None else None
+                    print(f"Ordered books: {ordered_books}")  # Debugging print
                 else:
                     print(f"Warning: Invalid idxs_order shape {self.idxs_order.shape}, using default order")
                     ordered_matrix = matrix
@@ -733,6 +737,7 @@ class BookSimilarityDashboard:
                 labels = [f'{book}' for book in ordered_books]
             else:
                 labels = ordered_books
+            print(f"Final tick labels: {labels}")  # Debugging print
                 
         except Exception as e:
             print(f"Warning: Error in reordering ({e}), using default order")
@@ -1457,8 +1462,8 @@ class BookSimilarityDashboard:
             if current_fig is None:
                 return dash.no_update
             # Scale existing alpha values multiplicatively by `edge_opacity`.
-            # Handles binned traces named like 'edges_{alpha}', traces with
-            # `line.colorscale`, numeric `line.color` arrays, and `rgba(...)` strings.
+            # Handles binned traces named like 'edges_{orig_alpha:.2f}'
+            # traces with `line.colorscale`, numeric `line.color` arrays, and `rgba(...)` strings.
             if edge_opacity is None:
                 return dash.no_update
 
