@@ -14,6 +14,7 @@ import glob
 import pickle
 from datetime import datetime
 import time
+from memory_profiler import memory_usage
 
 try:
     import umap
@@ -21,6 +22,19 @@ try:
 except ImportError:
     UMAP_AVAILABLE = False
     print("Warning: UMAP not installed. Install with 'pip install umap-learn' for UMAP layouts.")
+
+class Profiler:
+    @staticmethod
+    def profile_memory(func):
+        def wrapper(*args, **kwargs):
+            mem_before = memory_usage(-1, interval=0.1, timeout=1)[0]
+            start_time = time.perf_counter()
+            result = func(*args, **kwargs)
+            end_time = time.perf_counter()
+            mem_after = memory_usage(-1, interval=0.1, timeout=1)[0]
+            print(f"[PROFILE] {func.__name__}: Time elapsed: {end_time - start_time:.4f}s, Memory used: {mem_after - mem_before:.2f} MiB")
+            return result
+        return wrapper
 
 class BookSimilarityDashboard:
     # Cache size limits for memory optimization
@@ -72,12 +86,69 @@ class BookSimilarityDashboard:
             metric = 1 - (self.w_rm.astype(np.float64) + self.w_it.astype(np.float64)) / 2
             self.idxs_order = self._hierarchical_order(metric)
         
+        # reorder matrices
+        self.w_rm = self.w_rm[np.ix_(self.idxs_order, self.idxs_order)]
+        self.w_it = self.w_it[np.ix_(self.idxs_order, self.idxs_order)]
+        self.books = self.books[self.idxs_order]
+        self.impr_names = self.impr_names[self.idxs_order]
+        self.n1hat_rm = self.n1hat_rm[np.ix_(self.idxs_order, self.idxs_order)]
+        self.n1hat_it = self.n1hat_it[np.ix_(self.idxs_order, self.idxs_order)]
+        
+        # Precompute top edges and binned edges for network graphs (top 10000 by weight from each font type matrix)
+        self._top_edges = {}
+        self._binned_edges = {}
+        top_k = 10000
+        n_bins = 10
+        for font_type in ['roman', 'italic', 'combined']:
+            if font_type == 'roman':
+                matrix = self.w_rm
+            elif font_type == 'italic':
+                matrix = self.w_it
+            else:
+                matrix = (self.w_rm + self.w_it) / 2
+            upper_mask = np.triu(np.ones_like(matrix, dtype=bool), k=1)
+            edge_weights = matrix[upper_mask]
+            i_indices, j_indices = np.where(upper_mask)
+            # Sort by weight descending
+            sorted_indices = np.argsort(edge_weights)[::-1]
+            self._top_edges[font_type] = [(i_indices[idx], j_indices[idx]) for idx in sorted_indices[:top_k]]
+            
+            # Now compute binned edges using the top edges
+            top_edge_weights = np.array([matrix[i, j] for i, j in self._top_edges[font_type]])
+            if len(top_edge_weights) == 0 or top_edge_weights.max() == top_edge_weights.min():
+                self._binned_edges[font_type] = {i: {'edges': [], 'avg_w': 0} for i in range(n_bins)}
+                continue
+            bins = np.linspace(top_edge_weights.min(), top_edge_weights.max(), n_bins + 1)
+            bin_indices = np.digitize(top_edge_weights, bins) - 1
+            bin_indices = np.clip(bin_indices, 0, n_bins - 1)
+            self._binned_edges[font_type] = {}
+            for bin_idx in range(n_bins):
+                indices = np.where(bin_indices == bin_idx)[0]
+                edges_in_bin = [self._top_edges[font_type][i] for i in indices]
+                avg_w = np.mean([matrix[i, j] for i, j in edges_in_bin]) if edges_in_bin else 0
+                self._binned_edges[font_type][bin_idx] = {'edges': edges_in_bin, 'avg_w': avg_w}
+        
+        # Cache max similarity per font type (doesn't depend on threshold)
+        self._max_similarity_cache = {
+            'roman': np.max(self.w_rm),
+            'italic': np.max(self.w_it),
+            'combined': np.max((self.w_rm + self.w_it) / 2)
+        }
+        
+        # Pre-compute printer markers for reuse
+        self._precompute_printer_markers()
+        
+        # Create base heatmap figure for reuse (with combined data)
+        combined_matrix = (self.w_rm + self.w_it) / 2
+        combined_n1hat = self.n1hat_rm + self.n1hat_it
+        self._base_heatmap_fig = self._create_heatmap(combined_matrix, combined_n1hat, "Book Similarity Matrix (Combined)", reorder=False)
+        
         # Pre-compute figures cache
         self._figures_cache = figures_cache if figures_cache else {}
         self._figures_cache_file = './dashboard_figures_cache.pkl'
         self._precompute_figures()
-        
-        
+        self._last_umap_positions = self._figures_cache.get('umap_positions_50_0.5', None)
+        self.edge_opacity = 1.0
         # Save figures cache to disk for next startup
         self._save_figures_cache()
         
@@ -229,6 +300,7 @@ class BookSimilarityDashboard:
         elapsed = time.time() - start
         print(f"Built and saved per-book caches and metadata in {elapsed:.2f} seconds")
     
+    @Profiler.profile_memory
     def _hierarchical_order(self, distance_matrix):
         """Create hierarchical ordering of books"""
         try:
@@ -294,9 +366,64 @@ class BookSimilarityDashboard:
             
         elapsed = time.time() - start
         print(f"✓ Essential data cached in {elapsed:.2f} seconds")
+
+    def _precompute_printer_markers(self):
+        """Precompute printer marker positions and colors for reuse."""
+        impr_to_color, impr_to_marker, unique_imprs = self._get_printer_colors()
+        self._printer_markers = {
+            'colors': impr_to_color,
+            'markers': impr_to_marker,
+            'unique_imprinters': unique_imprs
+        }
+        
+        # Precompute marker traces for heatmaps (positions are fixed due to hierarchical ordering)
+        self._printer_marker_traces = []
+        if self.impr_names is not None:
+            # Use the ordered impr_names and books (fixed order)
+            ordered_impr = self.impr_names
+            labels = [f'{book}' for book in self.books]  # Same labels for all heatmaps
+            
+            # Get all indices for each printer
+            printer_indices = {}
+            for impr in unique_imprs:
+                indices = [i for i, p in enumerate(ordered_impr) if p == impr]
+                if indices:
+                    printer_indices[impr] = indices
+            
+            # Create scatter traces for each printer
+            for impr, indices in printer_indices.items():
+                marker_info = {
+                    'marker': impr_to_marker[impr],
+                    'color': impr_to_color[impr]
+                }
+                # Positions are the same for all heatmaps
+                x_positions = [labels[i] for i in indices]
+                y_positions = [labels[i] for i in indices]
+                # For customdata, we'll use a placeholder since n1hat varies; update when adding to figure
+                customdata = np.array([0] * len(indices))[:, None]  # Placeholder
+                
+                trace = go.Scatter(
+                    x=x_positions,
+                    y=y_positions,
+                    mode='markers',
+                    marker=dict(
+                        symbol=marker_info['marker'],
+                        size=10,
+                        color=marker_info['color'],
+                        line=dict(color='white', width=1)
+                    ),
+                    showlegend=True,
+                    legendgroup=impr,
+                    name=impr,
+                    customdata=customdata,
+                    hovertemplate=f'Printer: {impr}<br>Book: %{{x}}<br>Types: %{{customdata[0]}}<extra></extra>'
+                )
+                self._printer_marker_traces.append(trace)
+
     
+    @Profiler.profile_memory
     def _rebuild_heatmap(self, font_type, title):
-        """Rebuild a heatmap figure from cached data."""
+        """Update the base heatmap figure with new data."""
         if font_type == 'combined':
             matrix = (self.w_rm + self.w_it) / 2
             n1hat = self.n1hat_rm + self.n1hat_it
@@ -307,16 +434,21 @@ class BookSimilarityDashboard:
             matrix = self.w_it
             n1hat = self.n1hat_it
 
-        # Apply hierarchical ordering
-        # order = self.idxs_order        
-        # print(f"Applying hierarchical order: {order}")  # Debugging print
-        # # Apply the hierarchical order
-        # ordered_matrix = matrix[np.ix_(order, order)]
-        # ordered_n1hat = n1hat[np.ix_(order, order)] if n1hat is not None else None
+        # Update the base figure's z data
+        self._base_heatmap_fig.data[0].z = n1hat if n1hat is not None else matrix
         
-        # print(f"Ordered matrix shape: {ordered_matrix.shape}")  # Debugging print
-        # Use the existing _create_heatmap method with ordered data
-        return self._create_heatmap(matrix, n1hat, title, reorder=True)
+        # Update title
+        self._base_heatmap_fig.update_layout(title=dict(text=title, x=0.5, font=dict(size=18)))
+        
+        # Update customdata for marker traces
+        for i in range(1, len(self._base_heatmap_fig.data)):
+            trace = self._base_heatmap_fig.data[i]
+            impr = trace.name
+            indices = [j for j, p in enumerate(self.impr_names) if p == impr]
+            types = [n1hat[j, j] if n1hat is not None else matrix[j, j] for j in indices]
+            trace.customdata = np.array(types)[:, None]
+        
+        return self._base_heatmap_fig
 
     
     def _save_figures_cache(self):
@@ -359,6 +491,7 @@ class BookSimilarityDashboard:
         return self._rebuild_heatmap(font_type, title)
 
     
+    @Profiler.profile_memory
     def _compute_umap_positions(self, distance_matrix, n_neighbors=50, min_dist=0.5, random_state=42):
         """Compute UMAP positions from distance matrix"""
         if not UMAP_AVAILABLE:
@@ -406,25 +539,23 @@ class BookSimilarityDashboard:
         
         return impr_to_color, impr_to_marker, unique_imprs
 
+    @Profiler.profile_memory
     def _create_network_graph(self, weight_matrix, threshold=0.1, layout_type='umap',
                          n_neighbors=50, min_dist=0.5, umap_positions=None, edge_opacity=0.3, n1hat_matrix=None,
-                         marker_size=12, label_size=8):
+                         marker_size=12, label_size=8, font_type='combined'):
         """Create network graph from weight matrix with UMAP positioning and printer colors"""
         
-        # Filter by threshold (vectorized for performance)
-        mask = weight_matrix > threshold
-        upper_mask = np.triu(mask, k=1)  # Upper triangle, exclude diagonal
-        i_indices, j_indices = np.where(upper_mask)
-        edges = list(zip(i_indices, j_indices))
-        edge_weights = weight_matrix[upper_mask]
+        # Use precomputed top edges
+        edges = self._top_edges[font_type]
+        edge_weights = np.array([weight_matrix[i, j] for i, j in edges])
         
         edges_array = np.array(edges)  # For vectorized operations
         
         if not edges:
-            print(f"Warning: No edges found with threshold {threshold}. Max similarity: {np.max(weight_matrix):.4f}")
+            print(f"Warning: No edges found. Max similarity: {np.max(weight_matrix):.4f}")
             fig = go.Figure()
             fig.add_annotation(
-                text=f"No connections above threshold {threshold:.3f}<br>Max similarity: {np.max(weight_matrix):.4f}<br>Try lowering the threshold",
+                text=f"No connections<br>Max similarity: {np.max(weight_matrix):.4f}",
                 xref="paper", yref="paper",
                 x=0.5, y=0.5, xanchor='center', yanchor='middle',
                 showarrow=False, font=dict(size=16)
@@ -452,7 +583,9 @@ class BookSimilarityDashboard:
             pos = None  # Will use spring layout
         
         # Get printer colors and markers (matching heatmap)
-        impr_to_color, impr_to_marker, unique_imprs = self._get_printer_colors()
+        impr_to_color = self._printer_markers['colors']
+        impr_to_marker = self._printer_markers['markers']
+        unique_imprs = self._printer_markers['unique_imprinters']
         
         # Convert pos to array for vectorized operations
         pos_array = np.array([pos[i] for i in range(len(pos))])
@@ -461,88 +594,35 @@ class BookSimilarityDashboard:
         # Create figure
         fig = go.Figure()
         
-        # Add ALL edges as a SINGLE trace using None separators (much faster for legend interactions)
-        # This dramatically reduces the number of traces from hundreds to just one
-        x0 = pos_array[edges_array[:, 0], 0]
-        x1 = pos_array[edges_array[:, 1], 0]
-        y0 = pos_array[edges_array[:, 0], 1]
-        y1 = pos_array[edges_array[:, 1], 1]
-
-        # Single edge trace with opacity varying by weight (edge_weight * edge_opacity)
-        # try:
-        # Parameters you can tweak
-        bottom_pct = 0.90   # fraction of edges to send to zero (bulk)
-        top_pct = 0.999     # top fraction that should become alpha ~1
-        gamma = 2.0         # >1 makes mapping more aggressive (pushes values toward 0/1)
-        n_bins = 8          # number of binned traces (performance vs fidelity)
-
-        eps = 1e-12
-        # percentile anchors
-        p_low = np.quantile(edge_weights, bottom_pct)
-        p_high = np.quantile(edge_weights, top_pct)
-
-        # safety if distribution degenerate
-        if p_high <= p_low:
-            p_low = np.min(edge_weights)
-            p_high = np.max(edge_weights) if np.max(edge_weights) > p_low else p_low + eps
-
-        # log-scale mapping from weight -> [0,1]
-        log_w = np.log10(edge_weights + eps)
-        log_low = np.log10(p_low + eps)
-        log_high = np.log10(p_high + eps)
-        raw = (log_w - log_low) / (log_high - log_low)
-        scaled = np.clip(raw, 0.0, 1.0) ** gamma   # raise to gamma for more contrast (optional)
-
-        # bin scaled alphas and add one trace per bin (concatenated lines with None separators)
-        bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
-        bin_indices = np.digitize(scaled, bin_edges) - 1
-
-        for b in range(n_bins):
-            mask = bin_indices == b
-            if not np.any(mask):
+        # Add edges in binned traces for efficient opacity control
+        bins = self._binned_edges.get(font_type, {})
+        for bin_idx in range(10):  # n_bins
+            bin_data = bins.get(bin_idx, {'edges': [], 'avg_w': 0})
+            edges_in_bin = bin_data['edges']
+            avg_w = bin_data['avg_w']
+            if not edges_in_bin:
                 continue
-            # build None-separated lines for this bin
-            xs = np.concatenate([x0[mask], x1[mask], np.full(np.sum(mask), None, dtype=object)])
-            ys = np.concatenate([y0[mask], y1[mask], np.full(np.sum(mask), None, dtype=object)])
-            # use midpoint of bin for display alpha
-            alpha = ((bin_edges[b] + bin_edges[b+1]) / 2.0)
-            color = f"rgba(100,100,100,{alpha})"
-            print(color)
+            x_all = []
+            y_all = []
+            for i, j in edges_in_bin:
+                x0, y0 = pos_array[i]
+                x1, y1 = pos_array[j]
+                x_all.extend([x0, x1, None])
+                y_all.extend([y0, y1, None])
+            opacity = min(1.0, avg_w * edge_opacity)
+            color = f'rgba(100,100,100,{opacity})'
             fig.add_trace(go.Scatter(
-                x=xs.tolist(), y=ys.tolist(),
-                mode="lines",
+                x=x_all,
+                y=y_all,
+                mode='lines',
                 line=dict(width=1, color=color),
                 showlegend=False,
-                name=f"edges_{alpha:.2f}",
-            ))  
-
-            # # Prepare per-edge intensity values (0..1) from weights            
-            # for (x0_, x1_, y0_, y1_, w) in zip(x0, x1, y0, y1, edge_weights):
-
-            #     alpha = float(w) * edge_opacity
-            #     color = f"rgba(100,100,100,{alpha})"
-
-            #     fig.add_trace(go.Scatter(
-            #         x=[x0_, x1_],
-            #         y=[y0_, y1_],
-            #         mode="lines",
-            #         line=dict(width=2, color=color),
-            #         showlegend=False,
-            #         name='edges',
-            #     ))
-        # except Exception:
-        #     print('Trace Fallback')
-        #     # Fallback to uniform color if per-segment coloring is not supported by the renderer
-        #     fig.add_trace(go.Scatter(
-        #         x=edge_x, y=edge_y,
-        #         mode='lines',
-        #         line=dict(width=2, color=f'rgba(100, 100, 100, {edge_opacity})'),
-        #         hoverinfo='text',
-        #         hovertext=edge_text,
-        #         showlegend=False,
-        #         name='edges',
-        #     ))
+                name=f'bin_{bin_idx}',
+                customdata=[avg_w],  # Store average weight for updating
+                hoverinfo='skip'
+            ))
         
+
         # Add nodes colored by printer, one trace per printer for legend
         # Using same colors and markers as heatmap diagonal
         for impr in unique_imprs:
@@ -634,7 +714,44 @@ class BookSimilarityDashboard:
             paper_bgcolor='white'
         )
         
+        self._last_umap_positions = pos
         return fig
+    
+    @Profiler.profile_memory
+    def _update_network_edges(self, current_fig, weight_matrix, threshold, edge_opacity, n1hat_matrix, umap_pos_array, font_type):
+        """Update edge traces in the network figure for new weight_matrix and threshold, keeping node traces."""
+        # Use binned edges for the font type
+        bins = self._binned_edges.get(font_type, {})
+        
+        # Use Patch for efficient update
+        patched = dash.Patch()
+        
+        # Update bin traces by iterating through data and checking names
+        for i, trace in enumerate(current_fig['data']):
+            if trace['name'].startswith('bin_'):
+                bin_idx = int(trace['name'].split('_')[1])
+                bin_data = bins.get(bin_idx, {'edges': [], 'avg_w': 0})
+                edges_in_bin = bin_data['edges']
+                avg_w = bin_data['avg_w']
+                if not edges_in_bin:
+                    patched['data'][i]['x'] = []
+                    patched['data'][i]['y'] = []
+                    patched['data'][i]['line']['color'] = 'rgba(100,100,100,0)'
+                else:
+                    x_all = []
+                    y_all = []
+                    for edge_i, edge_j in edges_in_bin:
+                        x0, y0 = umap_pos_array[edge_i]
+                        x1, y1 = umap_pos_array[edge_j]
+                        x_all.extend([x0, x1, None])
+                        y_all.extend([y0, y1, None])
+                    opacity = min(1.0, avg_w * edge_opacity)
+                    color = f'rgba(100,100,100,{opacity})'
+                    patched['data'][i]['x'] = x_all
+                    patched['data'][i]['y'] = y_all
+                    patched['data'][i]['line']['color'] = color
+        
+        return patched
     
     def _get_available_letters_for_books(self, book1, book2, font_type='roman', letter_images_path='./letter_images/'):
         """Get list of letters that have images available for either of the two specified books using the metadata index."""
@@ -652,7 +769,6 @@ class BookSimilarityDashboard:
                     letters.add(letter)
 
         result = sorted(list(letters))
-        print(f"DEBUG: Found letters for {book1} and {book2}: {result}")
         return result
     
     def _get_available_letters_for_single_book(self, book, font_type='roman'):
@@ -708,6 +824,7 @@ class BookSimilarityDashboard:
 
         return sorted(images, key=extract_number)
     
+    @Profiler.profile_memory
     def _create_heatmap(self, matrix, n1hat, title="Similarity Matrix", reorder=False):
         """Create similarity matrix heatmap matching notebook style"""
         
@@ -715,11 +832,25 @@ class BookSimilarityDashboard:
             if reorder and hasattr(self, 'idxs_order') and self.idxs_order is not None:
                 # Ensure idxs_order is 1D and contains valid indices
                 if self.idxs_order.ndim == 1 and np.all(self.idxs_order < len(self.books)):
+                    start_time = time.perf_counter()
                     ordered_matrix = matrix[np.ix_(self.idxs_order, self.idxs_order)]
+                    elapsed_time = time.perf_counter() - start_time
+                    print(f"[PROFILE] Matrix reordering: Time elapsed: {elapsed_time:.4f}s")
+
+                    start_time = time.perf_counter()
                     ordered_books = self.books[self.idxs_order]
+                    elapsed_time = time.perf_counter() - start_time
+                    print(f"[PROFILE] Books reordering: Time elapsed: {elapsed_time:.4f}s")
+
+                    start_time = time.perf_counter()
                     ordered_impr = self.impr_names[self.idxs_order] if self.impr_names is not None else None
+                    elapsed_time = time.perf_counter() - start_time
+                    print(f"[PROFILE] Imprinters reordering: Time elapsed: {elapsed_time:.4f}s")
+
+                    start_time = time.perf_counter()
                     ordered_n1hat = n1hat[np.ix_(self.idxs_order, self.idxs_order)] if n1hat is not None else None
-                    print(f"Ordered books: {ordered_books}")  # Debugging print
+                    elapsed_time = time.perf_counter() - start_time
+                    print(f"[PROFILE] N1hat reordering: Time elapsed: {elapsed_time:.4f}s")
                 else:
                     print(f"Warning: Invalid idxs_order shape {self.idxs_order.shape}, using default order")
                     ordered_matrix = matrix
@@ -734,10 +865,12 @@ class BookSimilarityDashboard:
 
             # Create labels in notebook format: "book | imprinter"
             if ordered_impr is not None:
+                start_time = time.perf_counter()
                 labels = [f'{book}' for book in ordered_books]
+                elapsed_time = time.perf_counter() - start_time
+                print(f"[PROFILE] Label creation: Time elapsed: {elapsed_time:.4f}s")
             else:
                 labels = ordered_books
-            print(f"Final tick labels: {labels}")  # Debugging print
                 
         except Exception as e:
             print(f"Warning: Error in reordering ({e}), using default order")
@@ -751,14 +884,8 @@ class BookSimilarityDashboard:
                 labels = ordered_books
 
         # Create discrete colormap matching notebook style
-        #vmin, vmax = ordered_matrix.min(), ordered_matrix.max()
-        vmin = ordered_n1hat.min() if ordered_n1hat is not None else ordered_matrix.min()  # Fixed range for similarity
-        vmax = ordered_n1hat.max() if ordered_n1hat is not None else ordered_matrix.max()  # Fixed range for similarity
-        
-        # Handle edge case where all values are the same
-        if vmin == vmax:
-            vmin -= 0.1
-            vmax += 0.1
+        vmin = ordered_n1hat.min()
+        vmax = ordered_n1hat.max()
         
         n_books = len(labels)
         
@@ -791,68 +918,14 @@ class BookSimilarityDashboard:
             showscale=False  # Hide colorbar to avoid legend overlap
         ))
         
-        # Add printer markers on diagonal and row/column overlays
-        if ordered_impr is not None:
-            # Create printer color/marker mapping like notebook
-            unique_imprs = [impr for impr in np.unique(ordered_impr) if impr not in ['n. nan', 'm. missing']]
-            
-            # Use consistent colors and markers for printers
-            markers = ['circle', 'square', 'diamond']
-            colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F']
-            
-            printer_markers = {}
-            for i, impr in enumerate(unique_imprs):
-                printer_markers[impr] = {
-                    'marker': markers[i % len(markers)],
-                    'color': colors[i % len(colors)]
-                }
-            
-            # Get all indices for each printer (for individual row/column overlays)
-            printer_indices = {}
-            for impr in unique_imprs:
+        # Add precomputed printer marker traces
+        if ordered_impr is not None and hasattr(self, '_printer_marker_traces'):
+            for trace in self._printer_marker_traces:
+                impr = trace.name
                 indices = [i for i, p in enumerate(ordered_impr) if p == impr]
-                if indices:
-                    printer_indices[impr] = indices
-            
-            # Add row/column overlays as shapes with printer name embedded
-            for impr, indices in printer_indices.items():
-                if impr in printer_markers:
-                    color = printer_markers[impr]['color']
-                    # Convert hex to rgba with alpha
-                    rgba_color = f"rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, 0.3)"
-                    
-                    # Skip overlays for performance - keep only diagonal markers
-                    # for idx in indices:
-                    #     # Horizontal band (row overlay) for this book
-                    #     fig.add_shape(...)
-                    #     # Vertical band (column overlay) for this book
-                    #     fig.add_shape(...)
-            
-            # Add diagonal markers as scatter traces (respond to legend clicks)
-            for impr, indices in printer_indices.items():
-                if impr in printer_markers:
-                    marker_info = printer_markers[impr]
-                    # Use labels for categorical axis
-                    x_positions = [labels[i] for i in indices]
-                    y_positions = [labels[i] for i in indices]
-                    types = [ordered_n1hat[i, i] if ordered_n1hat is not None else ordered_matrix[i, i] for i in indices]
-                    
-                    fig.add_trace(go.Scatter(
-                        x=x_positions,
-                        y=y_positions,
-                        mode='markers',
-                        marker=dict(
-                            symbol=marker_info['marker'],
-                            size=10,
-                            color=marker_info['color'],
-                            line=dict(color='white', width=1)
-                        ),
-                        showlegend=True,
-                        legendgroup=impr,
-                        name=impr,
-                        customdata=np.array(types)[:, None],
-                        hovertemplate=f'Printer: {impr}<br>Book: %{{x}}<br>Types: %{{customdata[0]}}<extra></extra>'
-                    ))
+                types = [ordered_n1hat[i, i] if ordered_n1hat is not None else ordered_matrix[i, i] for i in indices]
+                trace.customdata = np.array(types)[:, None]
+                fig.add_trace(trace)
         
         # Calculate figure size for web viewing - ensure square aspect ratio
         base_size = max(700, min(1000, n_books * 25))  # Scale with books, web-optimized
@@ -936,7 +1009,19 @@ class BookSimilarityDashboard:
                                    'backgroundColor': '#fff', 'borderRadius': '5px', 'border': '1px solid #ddd'}
                     )
                 ], style={'textAlign': 'center'}),
-                # Hidden elements to maintain compatibility - threshold fixed at 0.1, layout always umap
+                html.Div([
+                    html.Label("Similarity Threshold:", style={'fontSize': '14px', 'fontWeight': 'bold', 'marginRight': '15px', 'color': '#333'}),
+                    dcc.Slider(
+                        id='threshold-slider-input',
+                        min=0.0,
+                        max=0.5,
+                        step=0.01,
+                        value=0.1,
+                        marks={0: '0', 0.1: '0.1', 0.25: '0.25', 0.5: '0.5'},
+                        tooltip={"placement": "bottom", "always_visible": False}
+                    )
+                ], style={'marginTop': '10px'}),
+                # Hidden elements to maintain compatibility - threshold updated by slider, layout always umap
                 dcc.Store(id='threshold-slider', data=0.1),
                 dcc.Store(id='layout-dropdown', data='umap'),
             ], style={'marginBottom': 10, 'padding': '15px 20px', 'backgroundColor': '#f0f8ff', 'borderRadius': '8px', 'border': '2px solid #4a90d9'}),
@@ -1167,6 +1252,14 @@ class BookSimilarityDashboard:
     
     def _setup_callbacks(self):
         """Setup dashboard callbacks"""
+        
+        # Update threshold store when slider changes
+        @self.app.callback(
+            Output('threshold-slider', 'data'),
+            [Input('threshold-slider-input', 'value')]
+        )
+        def update_threshold_store(value):
+            return value
         
         # Initialize letter filter and printer dropdown on load
         @self.app.callback(
@@ -1451,6 +1544,15 @@ class BookSimilarityDashboard:
                 return positions.tolist()  # Convert to list for JSON serialization
             return None
         
+        # Reset edge opacity slider to 1.0 when font type changes
+        @self.app.callback(
+            Output('edge-opacity-slider', 'value'),
+            [Input('font-type-dropdown', 'value')],
+            prevent_initial_call=False
+        )
+        def reset_opacity_on_font_change(font_type):
+            return 1.0
+        
         # Separate callback for edge opacity - uses Patch for instant updates
         @self.app.callback(
             Output('network-graph', 'figure', allow_duplicate=True),
@@ -1458,85 +1560,25 @@ class BookSimilarityDashboard:
             [State('network-graph', 'figure')],
             prevent_initial_call=True
         )
+        @Profiler.profile_memory
         def update_edge_opacity_only(edge_opacity, current_fig):
             if current_fig is None:
                 return dash.no_update
-            # Scale existing alpha values multiplicatively by `edge_opacity`.
-            # Handles binned traces named like 'edges_{orig_alpha:.2f}'
-            # traces with `line.colorscale`, numeric `line.color` arrays, and `rgba(...)` strings.
             if edge_opacity is None:
                 return dash.no_update
 
+            self.edge_opacity = edge_opacity  # Store current opacity
             patched = dash.Patch()
-            traces = current_fig.get('data', [])
-
-            for i, trace in enumerate(traces):
-                if not trace:
-                    continue
-                name = str(trace.get('name', '') or '')
-                line = trace.get('line', {}) if isinstance(trace.get('line', {}), dict) else {}
-
-                # Binned trace naming convention: 'edges_{orig_alpha:.2f}'
-                if name.startswith('edges_'):
-                    try:
-                        orig_alpha = float(name.split('_')[-1])
-                    except Exception:
-                        orig_alpha = None
-                    if orig_alpha is not None:
-                        new_a = max(0.0, min(1.0, orig_alpha * float(edge_opacity)))
-                        # Preserve existing RGB if possible
-                        existing_color = line.get('color')
-                        if isinstance(existing_color, str) and 'rgba' in existing_color:
-                            parts = existing_color.replace('rgba(', '').replace(')', '').split(',')
-                            if len(parts) >= 3:
-                                r, g, b = parts[0].strip(), parts[1].strip(), parts[2].strip()
-                                patched['data'][i]['line']['color'] = f'rgba({r},{g},{b},{new_a})'
-                                continue
-                        # Fallback color
-                        patched['data'][i]['line']['color'] = f'rgba(100,100,100,{new_a})'
-                        continue
-
-                # If trace uses a colorscale for mapping numeric values -> update its opaque end
-                if 'colorscale' in line:
-                    try:
-                        cs = line.get('colorscale') or []
-                        # Try to extract RGB from last colorscale color
-                        rgb = (100, 100, 100)
-                        if cs and isinstance(cs, (list, tuple)) and len(cs) > 0:
-                            last = cs[-1][1]
-                            if isinstance(last, str) and 'rgba' in last:
-                                parts = last.replace('rgba(', '').replace(')', '').split(',')
-                                if len(parts) >= 3:
-                                    rgb = (int(parts[0].strip()), int(parts[1].strip()), int(parts[2].strip()))
-                        new_a = max(0.0, min(1.0, float(edge_opacity)))
-                        patched['data'][i]['line']['colorscale'] = [[0.0, f'rgba({rgb[0]},{rgb[1]},{rgb[2]}, 0)'], [1.0, f'rgba({rgb[0]},{rgb[1]},{rgb[2]},{new_a})']]
-                    except Exception:
-                        # safest fallback
-                        patched['data'][i]['line']['colorscale'] = [[0.0, 'rgba(100,100,100,0)'], [1.0, f'rgba(100,100,100,{edge_opacity})']]
-                    continue
-
-                # If line.color is a numeric array (weights) -> set/update colorscale max alpha
-                col = line.get('color', None)
-                if isinstance(col, (list, tuple)):
-                    patched['data'][i]['line']['colorscale'] = [[0.0, 'rgba(100,100,100,0)'], [1.0, f'rgba(100,100,100,{edge_opacity})']]
-                    continue
-
-                # If color is an rgba string, parse and scale its alpha
-                if isinstance(col, str) and 'rgba' in col:
-                    try:
-                        parts = col.replace('rgba(', '').replace(')', '').split(',')
-                        if len(parts) >= 3:
-                            r, g, b = parts[0].strip(), parts[1].strip(), parts[2].strip()
-                            orig_a = float(parts[3]) if len(parts) > 3 else 1.0
-                            new_a = max(0.0, min(1.0, orig_a * float(edge_opacity)))
-                            patched['data'][i]['line']['color'] = f'rgba({r},{g},{b},{new_a})'
-                            continue
-                    except Exception:
-                        patched['data'][i]['line']['color'] = f'rgba(100,100,100,{edge_opacity})'
-                        continue
-
-                # Otherwise: skip non-edge traces or unknown formats
-                # (we avoid touching node traces or unrelated items)
+            
+            # Update bin traces by iterating through data and checking names
+            for i, trace in enumerate(current_fig['data']):
+                if trace['name'].startswith('bin_'):
+                    customdata = trace.get('customdata', [])
+                    if customdata and len(customdata) > 0:
+                        w = customdata[0]
+                        new_a = min(1.0, w * float(edge_opacity))
+                        color = f'rgba(100,100,100,{new_a})'
+                        patched['data'][i]['line']['color'] = color
 
             return patched
         
@@ -1582,12 +1624,16 @@ class BookSimilarityDashboard:
              Input('umap-positions-store', 'data')],
             [State('umap-n-neighbors', 'value'),
              State('umap-min-dist', 'value'),
-             State('edge-opacity-slider', 'value'),
              State('node-size-slider', 'value'),
-             State('label-size-slider', 'value')]
+             State('label-size-slider', 'value'),
+             State('network-graph', 'figure'),
+             State('similarity-heatmap', 'figure')]
         )
-        def update_visualizations(threshold, layout, font_type, umap_positions, n_neighbors, min_dist, edge_opacity, node_size, label_size):
-            # ...existing code, but node_size and label_size come from State, not Input...
+        def update_visualizations(threshold, layout, font_type, umap_positions, n_neighbors, min_dist, node_size, label_size, current_network_fig, current_heatmap_fig):
+            # Determine what triggered the update
+            ctx = dash.callback_context
+            triggered_inputs = [t['prop_id'].split('.')[0] for t in ctx.triggered] if ctx.triggered else []
+            
             threshold = threshold if threshold is not None else 0.1
             layout = layout if layout is not None else 'umap'
             if font_type == 'roman':
@@ -1612,27 +1658,65 @@ class BookSimilarityDashboard:
                 n1hat_matrix = self.n1hat_it
             else:
                 n1hat_matrix = self.n1hat_rm + self.n1hat_it
-            network_fig = self._create_network_graph(
-                weight_matrix, threshold, layout,
-                n_neighbors=n_neighbors, min_dist=min_dist,
-                umap_positions=umap_pos_array, edge_opacity=edge_opacity,
-                n1hat_matrix=n1hat_matrix,
-                marker_size=node_size, label_size=label_size
-            )
-            heatmap_fig = self._get_cached_heatmap(font_type)
+            
+            # Check if UMAP positions changed
+            umap_changed = (umap_positions is None or 
+                            self._last_umap_positions is None or 
+                            not np.array_equal(np.array(umap_positions), self._last_umap_positions))
+            
+            # Calculate stats (always needed)
             total_connections = np.sum(weight_matrix > threshold)
-            avg_similarity = np.mean(weight_matrix[weight_matrix > threshold]) if total_connections > 0 else 0
-            max_similarity = np.max(weight_matrix)
             connected_books = len(np.where(np.sum(weight_matrix > threshold, axis=0) > 0)[0])
             stats = [
                 html.P(f"Total Books: {len(self.books)}"),
                 html.P(f"Connected Books (threshold > {threshold}): {connected_books}"),
                 html.P(f"Total Connections: {total_connections}"),
-                html.P(f"Average Similarity (above threshold): {avg_similarity:.3f}"),
-                html.P(f"Maximum Similarity: {max_similarity:.3f}"),
                 html.P(f"Symbols Analyzed: {len(self.symbs)}")
             ]
-            return network_fig, heatmap_fig, stats
+            
+            # Handle different update scenarios
+            only_font_type_changed = triggered_inputs == ['font-type-dropdown'] and not umap_changed and current_network_fig is not None and current_heatmap_fig is not None
+            only_threshold_changed = triggered_inputs == ['threshold-slider'] and current_network_fig is not None and current_heatmap_fig is not None
+            
+            if only_font_type_changed:
+                # Minimal update: patch heatmap z/title and network edges
+                heatmap_patch = dash.Patch()
+                heatmap_patch['data'][0]['z'] = n1hat_matrix if n1hat_matrix is not None else weight_matrix
+                heatmap_patch['layout']['title']['text'] = f"Book Similarity Matrix ({font_type.capitalize()})"
+                
+                # Update customdata for marker traces
+                for i in range(1, len(current_heatmap_fig['data'])):
+                    trace = current_heatmap_fig['data'][i]
+                    impr = trace['name']
+                    indices = [j for j, p in enumerate(self.impr_names) if p == impr]
+                    types = [n1hat_matrix[j, j] if n1hat_matrix is not None else weight_matrix[j, j] for j in indices]
+                    heatmap_patch['data'][i]['customdata'] = np.array(types)[:, None]
+                
+                network_patch = self._update_network_edges(current_network_fig, weight_matrix, threshold, self.edge_opacity, n1hat_matrix, umap_pos_array, font_type)
+                
+                return network_patch, heatmap_patch, stats
+            
+            elif only_threshold_changed:
+                # Only stats change, figures stay the same
+                return current_network_fig, current_heatmap_fig, stats
+            
+            else:
+                # Full update needed
+                if umap_changed or current_network_fig is None:
+                    network_fig = self._create_network_graph(
+                        weight_matrix, threshold, layout,
+                        n_neighbors=n_neighbors, min_dist=min_dist,
+                        umap_positions=umap_pos_array, edge_opacity=self.edge_opacity,
+                        n1hat_matrix=n1hat_matrix,
+                        marker_size=node_size, label_size=label_size, font_type=font_type
+                    )
+                    self._last_umap_positions = np.array(umap_positions) if umap_positions else None
+                else:
+                    network_fig = self._update_network_edges(current_network_fig, weight_matrix, threshold, self.edge_opacity, n1hat_matrix, umap_pos_array, font_type)
+                
+                heatmap_fig = self._get_cached_heatmap(font_type)
+                
+                return network_fig, heatmap_fig, stats
         
         # Toggle shape overlays when legend items are clicked
         @self.app.callback(
