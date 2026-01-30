@@ -14,7 +14,6 @@ import glob
 import pickle
 from datetime import datetime
 import time
-from memory_profiler import memory_usage
 
 try:
     import umap
@@ -22,19 +21,6 @@ try:
 except ImportError:
     UMAP_AVAILABLE = False
     print("Warning: UMAP not installed. Install with 'pip install umap-learn' for UMAP layouts.")
-
-class Profiler:
-    @staticmethod
-    def profile_memory(func):
-        def wrapper(*args, **kwargs):
-            mem_before = memory_usage(-1, interval=0.1, timeout=1)[0]
-            start_time = time.perf_counter()
-            result = func(*args, **kwargs)
-            end_time = time.perf_counter()
-            mem_after = memory_usage(-1, interval=0.1, timeout=1)[0]
-            print(f"[PROFILE] {func.__name__}: Time elapsed: {end_time - start_time:.4f}s, Memory used: {mem_after - mem_before:.2f} MiB")
-            return result
-        return wrapper
 
 class BookSimilarityDashboard:
     # Cache size limits for memory optimization
@@ -300,7 +286,6 @@ class BookSimilarityDashboard:
         elapsed = time.time() - start
         print(f"Built and saved per-book caches and metadata in {elapsed:.2f} seconds")
     
-    @Profiler.profile_memory
     def _hierarchical_order(self, distance_matrix):
         """Create hierarchical ordering of books"""
         try:
@@ -421,7 +406,6 @@ class BookSimilarityDashboard:
                 self._printer_marker_traces.append(trace)
 
     
-    @Profiler.profile_memory
     def _rebuild_heatmap(self, font_type, title):
         """Update the base heatmap figure with new data."""
         if font_type == 'combined':
@@ -491,7 +475,6 @@ class BookSimilarityDashboard:
         return self._rebuild_heatmap(font_type, title)
 
     
-    @Profiler.profile_memory
     def _compute_umap_positions(self, distance_matrix, n_neighbors=50, min_dist=0.5, random_state=42):
         """Compute UMAP positions from distance matrix"""
         if not UMAP_AVAILABLE:
@@ -539,7 +522,6 @@ class BookSimilarityDashboard:
         
         return impr_to_color, impr_to_marker, unique_imprs
 
-    @Profiler.profile_memory
     def _create_network_graph(self, weight_matrix, threshold=0.1, layout_type='umap',
                          n_neighbors=50, min_dist=0.5, umap_positions=None, edge_opacity=0.3, n1hat_matrix=None,
                          marker_size=12, label_size=8, font_type='combined'):
@@ -717,7 +699,6 @@ class BookSimilarityDashboard:
         self._last_umap_positions = pos
         return fig
     
-    @Profiler.profile_memory
     def _update_network_edges(self, current_fig, weight_matrix, threshold, edge_opacity, n1hat_matrix, umap_pos_array, font_type):
         """Update edge traces in the network figure for new weight_matrix and threshold, keeping node traces."""
         # Use binned edges for the font type
@@ -824,7 +805,6 @@ class BookSimilarityDashboard:
 
         return sorted(images, key=extract_number)
     
-    @Profiler.profile_memory
     def _create_heatmap(self, matrix, n1hat, title="Similarity Matrix", reorder=False):
         """Create similarity matrix heatmap matching notebook style"""
         
@@ -1560,7 +1540,6 @@ class BookSimilarityDashboard:
             [State('network-graph', 'figure')],
             prevent_initial_call=True
         )
-        @Profiler.profile_memory
         def update_edge_opacity_only(edge_opacity, current_fig):
             if current_fig is None:
                 return dash.no_update
