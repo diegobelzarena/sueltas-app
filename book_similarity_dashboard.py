@@ -414,7 +414,7 @@ class BookSimilarityDashboard:
                 pos = {i: umap_positions[i] for i in range(len(self.books))}
             else:
                 # Compute UMAP positions from distance matrix
-                distance_matrix = 1 - (self.w_rm + self.w_it) / 2  # Convert similarity to distance
+                distance_matrix = 1 - ((self.w_rm + self.w_it) / 2)  # Convert similarity to distance
                 np.fill_diagonal(distance_matrix, 0)
                 print("Computing UMAP positions for network layout...", umap_positions)
                 positions = self._compute_umap_positions(distance_matrix, n_neighbors, min_dist)
@@ -872,9 +872,6 @@ class BookSimilarityDashboard:
                             html.Button("Hide all printers", id='hide-all-printers-btn', n_clicks=0,
                                     style={'padding': '4px 10px', 'fontSize': '11px',
                                         'backgroundColor': '#f4e8e8', 'border': '1px solid #a44', 'borderRadius': '3px', 'cursor': 'pointer'}),
-                            html.Button("Toggle overlays", id='toggle-printer-overlays-btn', n_clicks=0,
-                                    style={'marginLeft': '15px', 'padding': '4px 10px', 'fontSize': '11px',
-                                        'backgroundColor': '#e8e8ff', 'border': '1px solid #44a', 'borderRadius': '3px', 'cursor': 'pointer'}),
                            ], style={'marginBottom': '5px', 'textAlign': 'center'}),
                         dcc.Graph(id='similarity-heatmap')
                     ], style={'width': '55%', 'display': 'inline-block', 'verticalAlign': 'top'}),
@@ -1110,11 +1107,11 @@ class BookSimilarityDashboard:
         def filter_books_by_printer(selected_printer):
             if selected_printer is None:
                 # Show all books
-                book_options = [{'label': f"{b} ({self.impr_names[i]})", 'value': b} 
+                book_options = [{'label': f"{b} ({self.impr_names[i] if self.impr_names[i] not in ['n. nan', 'm. missing'] else 'Unknown'})", 'value': b} 
                                for i, b in enumerate(self.books)]
             else:
                 # Filter books by printer
-                book_options = [{'label': f"{b} ({self.impr_names[i]})", 'value': b} 
+                book_options = [{'label': f"{b} ({self.impr_names[i] if self.impr_names[i] not in ['n. nan', 'm. missing'] else 'Unknown'})", 'value': b} 
                                for i, b in enumerate(self.books) 
                                if self.impr_names[i] == selected_printer]
             return sorted(book_options, key=lambda x: x['label'])
@@ -1127,7 +1124,7 @@ class BookSimilarityDashboard:
         )
         def toggle_select_all_printer_btn(selected_printer):
             base_style = {'marginTop': '5px', 'padding': '3px 8px', 'fontSize': '10px', 'backgroundColor': '#ffe8cc', 'border': '1px solid #cc8800', 'borderRadius': '3px', 'cursor': 'pointer'}
-            if selected_printer is not None:
+            if selected_printer is not None and selected_printer not in ['n. nan', 'm. missing', 'Unknown']:
                 return {**base_style, 'display': 'block'}
             return {**base_style, 'display': 'none'}
         
@@ -1142,7 +1139,7 @@ class BookSimilarityDashboard:
             if n_clicks and selected_printer:
                 # Get all books from this printer
                 books_from_printer = [b for i, b in enumerate(self.books) 
-                                      if self.impr_names[i] == selected_printer]
+                                      if (self.impr_names[i] if self.impr_names[i] not in ['n. nan', 'm. missing'] else 'Unknown') == selected_printer]
                 return books_from_printer
             return dash.no_update
         
@@ -1191,33 +1188,6 @@ class BookSimilarityDashboard:
             
             return dash.no_update, dash.no_update
         
-        # Toggle printer overlays (row/column alpha bands) in similarity matrix
-        import copy
-        @self.app.callback(
-            Output('similarity-heatmap', 'figure', allow_duplicate=True),
-            Input('toggle-printer-overlays-btn', 'n_clicks'),
-            State('similarity-heatmap', 'figure'),
-            prevent_initial_call=True
-        )
-        def toggle_printer_overlays(n_clicks, current_fig):
-            if not current_fig:
-                return dash.no_update
-
-            fig = copy.deepcopy(current_fig)
-
-            show = (n_clicks % 2 == 0)   # odd = visible, even = hidden
-            alpha = 0.3 if show else 0.0
-
-            for shape in fig.get('layout', {}).get('shapes', []):
-                if shape.get('name', '').startswith('overlay_'):
-                    color = shape.get('fillcolor', '')
-                    if color.startswith('rgba'):
-                        r, g, b, *_ = color.replace('rgba(', '').replace(')', '').split(',')
-                        shape['fillcolor'] = f"rgba({r},{g},{b},{alpha})"
-
-            fig['layout']['uirevision'] = 'constant'
-            return fig
-
             
         # Quick select buttons for letter filter
         @self.app.callback(
@@ -1859,6 +1829,8 @@ class BookSimilarityDashboard:
                     # Get printer name for this book
                     book_idx = np.where(self.books == book)[0]
                     printer_name = self.impr_names[book_idx[0]] if len(book_idx) > 0 else ''
+                    if printer_name in ['n. nan', 'm. missing']:
+                        printer_name = 'Unknown'
                     header_items.append(
                         html.Div([
                             html.P(f"{book}", style={'fontSize': '10px', 'fontWeight': 'bold', 'margin': '0', 'wordWrap': 'break-word'}),
