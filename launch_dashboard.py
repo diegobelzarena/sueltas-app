@@ -15,14 +15,23 @@ FIGURES_CACHE_FILE = './dashboard_figures_cache.pkl'
 
 def save_to_cache(books, w_rm, w_it, impr_names, symbs, n1hat_rm=None, n1hat_it=None, idxs_order=None):
     """Save all dashboard data to a single cache file"""
+    # Downcast large numeric arrays to float16 before saving to reduce cache size
+    try:
+        w_rm_save = w_rm.astype(np.float16) if isinstance(w_rm, np.ndarray) else w_rm
+        w_it_save = w_it.astype(np.float16) if isinstance(w_it, np.ndarray) else w_it
+        n1hat_rm_save = n1hat_rm.astype(np.float16) if isinstance(n1hat_rm, np.ndarray) else n1hat_rm
+        n1hat_it_save = n1hat_it.astype(np.float16) if isinstance(n1hat_it, np.ndarray) else n1hat_it
+    except Exception:
+        w_rm_save, w_it_save, n1hat_rm_save, n1hat_it_save = w_rm, w_it, n1hat_rm, n1hat_it
+
     cache_data = {
         'books': books,
-        'w_rm': w_rm,
-        'w_it': w_it,
+        'w_rm': w_rm_save,
+        'w_it': w_it_save,
         'impr_names': impr_names,
         'symbs': symbs,
-        'n1hat_rm': n1hat_rm,
-        'n1hat_it': n1hat_it,
+        'n1hat_rm': n1hat_rm_save,
+        'n1hat_it': n1hat_it_save,
         'idxs_order': idxs_order,
         'cached_at': datetime.now().isoformat(),
         'version': '2.0'
@@ -85,7 +94,21 @@ def load_from_cache():
         print(f"  - {len(books)} books, matrix shape: {w_rm.shape}")
         if idxs_order is not None:
             print(f"  - Hierarchical ordering: cached")
-        
+        # Downcast large matrices to float16 to reduce memory footprint immediately
+        try:
+            import gc
+            if isinstance(w_rm, np.ndarray):
+                w_rm = w_rm.astype(np.float16)
+            if isinstance(w_it, np.ndarray):
+                w_it = w_it.astype(np.float16)
+            if isinstance(n1hat_rm, np.ndarray):
+                n1hat_rm = n1hat_rm.astype(np.float16)
+            if isinstance(n1hat_it, np.ndarray):
+                n1hat_it = n1hat_it.astype(np.float16)
+            gc.collect()
+        except Exception:
+            pass
+
         return books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it, idxs_order
         
     except Exception as e:
@@ -110,12 +133,12 @@ def load_analysis_results(force_reload=False):
             return books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it, idxs_order, figures_cache
     
     try:
-        print("Loading from .npy files...")
-        # Load the exported weight matrices and data
-        w_rm = np.load('./w_rm_matrix.npy')
-        w_it = np.load('./w_it_matrix.npy')
-        n1hat_it = np.load('./n1hat_it_matrix.npy')
-        n1hat_rm = np.load('./n1hat_rm_matrix.npy')
+        print("Loading from .npy files... (using memmap where possible)")
+        # Load the exported weight matrices and data using memory-mapping to reduce peak RAM
+        w_rm = np.load('./w_rm_matrix.npy', mmap_mode='r')
+        w_it = np.load('./w_it_matrix.npy', mmap_mode='r')
+        n1hat_it = np.load('./n1hat_it_matrix.npy', mmap_mode='r')
+        n1hat_rm = np.load('./n1hat_rm_matrix.npy', mmap_mode='r')
         books = np.load('./books_dashboard.npy')
         print("✓ Loaded exported data from notebook analysis")
         
@@ -150,7 +173,22 @@ def load_analysis_results(force_reload=False):
         # Note: idxs_order will be computed by dashboard and saved later
         # Save to cache for next time (without ordering yet)
         save_to_cache(books, w_rm, w_it, impr_names, symbs, n1hat_rm=n1hat_rm, n1hat_it=n1hat_it, idxs_order=None)
-        
+
+        # Downcast large memmap arrays to float16 view to avoid large memory usage when possible
+        try:
+            import gc
+            if hasattr(w_rm, 'dtype'):
+                w_rm = np.asarray(w_rm, dtype=np.float16)
+            if hasattr(w_it, 'dtype'):
+                w_it = np.asarray(w_it, dtype=np.float16)
+            if hasattr(n1hat_rm, 'dtype'):
+                n1hat_rm = np.asarray(n1hat_rm, dtype=np.float16)
+            if hasattr(n1hat_it, 'dtype'):
+                n1hat_it = np.asarray(n1hat_it, dtype=np.float16)
+            gc.collect()
+        except Exception:
+            pass
+
         return books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it, None, None
             
     except FileNotFoundError as e:

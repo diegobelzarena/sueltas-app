@@ -23,6 +23,10 @@ except ImportError:
     print("Warning: UMAP not installed. Install with 'pip install umap-learn' for UMAP layouts.")
 
 class BookSimilarityDashboard:
+    # Cache size limits for memory optimization
+    MAX_FIGURE_CACHE_SIZE = 10  # Limit total cached figure/aux entries
+    MAX_UMAP_CACHE_SIZE = 5     # Limit cached UMAP parameter combinations
+
     def __init__(self, books, w_rm, w_it, impr_names=None, symbs=None, n1hat_rm=None, n1hat_it=None, cached_order=None, figures_cache=None):
         """
         Initialize the dashboard with your data.
@@ -46,12 +50,18 @@ class BookSimilarityDashboard:
         self.w_it = w_it
         self.n1hat_rm = n1hat_rm
         self.n1hat_it = n1hat_it
-        self.G = None  # NetworkX graph, initialized later
+        # Reduce precision to save memory (try float16 first)
+        try:
+            self.w_rm = self.w_rm.astype(np.float16)
+            self.w_it = self.w_it.astype(np.float16)
+        except:
+            self.w_rm = self.w_rm.astype(np.float32)
+            self.w_it = self.w_it.astype(np.float32)
         self.impr_names = impr_names if impr_names is not None else np.array([f"Unknown_{i}" for i in range(len(books))])
         self.symbs = symbs if symbs is not None else np.array([f"symbol_{i}" for i in range(w_rm.shape[0] if len(w_rm.shape) > 2 else 26)])
         
         # Remove isolated books
-        self.idxs_connected = np.where(np.sum((w_rm + w_it) > 0, axis=0) > 1)[0]
+        self.idxs_connected = np.where(np.sum((self.w_rm + self.w_it) > 0, axis=0) > 1)[0]
         
         # Use cached ordering if available, otherwise compute
         if cached_order is not None:
@@ -59,7 +69,7 @@ class BookSimilarityDashboard:
             self.idxs_order = cached_order
         else:
             print("Computing hierarchical ordering...")
-            metric = 1 - (self.w_rm + self.w_it) / 2
+            metric = 1 - (self.w_rm.astype(np.float64) + self.w_it.astype(np.float64)) / 2
             self.idxs_order = self._hierarchical_order(metric)
         
         # Pre-compute figures cache
@@ -81,11 +91,10 @@ class BookSimilarityDashboard:
         self._cache_dir = './images_cache/'  # Directory for per-book cache files
         os.makedirs(self._cache_dir, exist_ok=True)
 
-        # Image cache - per-book
-        self._image_cache = {}  # path -> encoded (used temporarily during cache build)
-        self._image_index = {}  # (book, font, letter) -> [(path, encoded), ...]
+        # Image cache removed for memory efficiency
+        # Images will be loaded on-demand without caching
         self._load_or_create_per_book_files(max_per_letter=3)  # 3 images per letter
-        
+                
         self._setup_layout()
         self._setup_callbacks()
         
@@ -255,7 +264,7 @@ class BookSimilarityDashboard:
 
 # Check if essential data or figures are already cached (support old and new formats)
         cached_available = (
-            ('umap_positions_15_0.5' in self._figures_cache)
+            ('umap_positions_50_0.5' in self._figures_cache)
             )
         
         if cached_available:
@@ -268,11 +277,19 @@ class BookSimilarityDashboard:
         # Cache network graph data (adjacency matrix + positions)
         default_threshold = 0.1
         default_layout = 'umap'
-        umap_positions = self._compute_umap_positions(1 - (self.w_rm + self.w_it) / 2)  # Default UMAP positions
+        umap_positions = self._compute_umap_positions(1 - (self.w_rm.astype(np.float64) + self.w_it.astype(np.float64)) / 2)  # Default UMAP positions
 
-        if 'umap_positions_15_0.5' not in self._figures_cache:
+        if 'umap_positions_50_0.5' not in self._figures_cache:
             print("  - Caching combined network data...")
-            self._figures_cache['umap_positions_15_0.5'] = umap_positions
+            # Store default UMAP positions (ensure small memory footprint)
+            self._figures_cache['umap_positions_50_0.5'] = umap_positions
+            # Trim figures cache if it grows beyond MAX_FIGURE_CACHE_SIZE
+            while len(self._figures_cache) > self.MAX_FIGURE_CACHE_SIZE:
+                # Remove the oldest non-default entry
+                for k in list(self._figures_cache.keys()):
+                    if k != 'umap_positions_50_0.5':
+                        del self._figures_cache[k]
+                        break
             
         elapsed = time.time() - start
         print(f"✓ Essential data cached in {elapsed:.2f} seconds")
@@ -304,6 +321,14 @@ class BookSimilarityDashboard:
         import pickle
         from datetime import datetime
         try:
+            # Trim cache before saving to keep disk cache small
+            default_key = 'umap_positions_50_0.5'
+            while len(self._figures_cache) > self.MAX_FIGURE_CACHE_SIZE:
+                for k in list(self._figures_cache.keys()):
+                    if k != default_key:
+                        del self._figures_cache[k]
+                        break
+
             cache_data = {
                 'data': self._figures_cache,  # Now contains essential data, not full figures
                 'cached_at': datetime.now().isoformat(),
@@ -317,7 +342,7 @@ class BookSimilarityDashboard:
     
     def _get_initial_umap_positions(self):
         """Get initial UMAP positions from cache for default parameters"""
-        default_cache_key = 'umap_positions_15_0.5'
+        default_cache_key = 'umap_positions_50_0.5'
         if default_cache_key in self._figures_cache:
             positions = self._figures_cache[default_cache_key]
             print(f"✓ Initializing UMAP store from cache ({len(positions)} positions)")
@@ -331,7 +356,7 @@ class BookSimilarityDashboard:
         return self._rebuild_heatmap(font_type, title)
 
     
-    def _compute_umap_positions(self, distance_matrix, n_neighbors=15, min_dist=0.5, random_state=42):
+    def _compute_umap_positions(self, distance_matrix, n_neighbors=50, min_dist=0.5, random_state=42):
         """Compute UMAP positions from distance matrix"""
         if not UMAP_AVAILABLE:
             print("UMAP not available, falling back to spring layout")
@@ -345,7 +370,9 @@ class BookSimilarityDashboard:
                 n_components=2,
                 random_state=random_state,
             )
-            positions = reducer.fit_transform(distance_matrix)
+            # UMAP expects float32 input for best performance/compatibility
+            dm = distance_matrix.astype(np.float32, copy=False)
+            positions = reducer.fit_transform(dm)
             return positions
         except Exception as e:
             print(f"UMAP failed: {e}, falling back to spring layout")
@@ -377,7 +404,7 @@ class BookSimilarityDashboard:
         return impr_to_color, impr_to_marker, unique_imprs
 
     def _create_network_graph(self, weight_matrix, threshold=0.1, layout_type='umap',
-                         n_neighbors=15, min_dist=0.5, umap_positions=None, edge_opacity=0.3, n1hat_matrix=None,
+                         n_neighbors=50, min_dist=0.5, umap_positions=None, edge_opacity=0.3, n1hat_matrix=None,
                          marker_size=12, label_size=8):
         """Create network graph from weight matrix with UMAP positioning and printer colors"""
         
@@ -402,10 +429,6 @@ class BookSimilarityDashboard:
             fig.update_layout(title="No Network Connections Found")
             return fig
         
-        # Create NetworkX graph
-        self.G = nx.Graph()
-        self.G.add_nodes_from(range(len(self.books)))
-        self.G.add_weighted_edges_from([(i, j, w) for (i, j), w in zip(edges, edge_weights)])
         
         # Calculate layout positions
         if layout_type == 'umap' and UMAP_AVAILABLE:
@@ -421,13 +444,9 @@ class BookSimilarityDashboard:
                 if positions is not None:
                     pos = {i: positions[i] for i in range(len(self.books))}
                 else:
-                    pos = nx.spring_layout(self.G, k=2, iterations=50)
-        elif layout_type == 'spring':
-            pos = nx.spring_layout(self.G, k=2, iterations=50)
-        elif layout_type == 'circular':
-            pos = nx.circular_layout(self.G)
+                    pos = None
         else:
-            pos = nx.spring_layout(self.G, k=2, iterations=50)
+            pos = None  # Will use spring layout
         
         # Get printer colors and markers (matching heatmap)
         impr_to_color, impr_to_marker, unique_imprs = self._get_printer_colors()
@@ -445,20 +464,81 @@ class BookSimilarityDashboard:
         x1 = pos_array[edges_array[:, 1], 0]
         y0 = pos_array[edges_array[:, 0], 1]
         y1 = pos_array[edges_array[:, 1], 1]
-        edge_x = np.concatenate([x0, x1, np.full(len(x0), None, dtype=object)]).tolist()
-        edge_y = np.concatenate([y0, y1, np.full(len(y0), None, dtype=object)]).tolist()
-        edge_text = []
-        
-        # Single edge trace with uniform opacity (controlled by slider)
-        fig.add_trace(go.Scatter(
-            x=edge_x, y=edge_y,
-            mode='lines',
-            line=dict(width=1, color=f'rgba(100, 100, 100, {edge_opacity})'),
-            hoverinfo='text',
-            hovertext=edge_text,
-            showlegend=False,
-            name='edges'  # Named for easy identification
-        ))
+
+        # Single edge trace with opacity varying by weight (edge_weight * edge_opacity)
+        # try:
+        # Parameters you can tweak
+        bottom_pct = 0.90   # fraction of edges to send to zero (bulk)
+        top_pct = 0.999     # top fraction that should become alpha ~1
+        gamma = 2.0         # >1 makes mapping more aggressive (pushes values toward 0/1)
+        n_bins = 8          # number of binned traces (performance vs fidelity)
+
+        eps = 1e-12
+        # percentile anchors
+        p_low = np.quantile(edge_weights, bottom_pct)
+        p_high = np.quantile(edge_weights, top_pct)
+
+        # safety if distribution degenerate
+        if p_high <= p_low:
+            p_low = np.min(edge_weights)
+            p_high = np.max(edge_weights) if np.max(edge_weights) > p_low else p_low + eps
+
+        # log-scale mapping from weight -> [0,1]
+        log_w = np.log10(edge_weights + eps)
+        log_low = np.log10(p_low + eps)
+        log_high = np.log10(p_high + eps)
+        raw = (log_w - log_low) / (log_high - log_low)
+        scaled = np.clip(raw, 0.0, 1.0) ** gamma   # raise to gamma for more contrast (optional)
+
+        # bin scaled alphas and add one trace per bin (concatenated lines with None separators)
+        bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+        bin_indices = np.digitize(scaled, bin_edges) - 1
+
+        for b in range(n_bins):
+            mask = bin_indices == b
+            if not np.any(mask):
+                continue
+            # build None-separated lines for this bin
+            xs = np.concatenate([x0[mask], x1[mask], np.full(np.sum(mask), None, dtype=object)])
+            ys = np.concatenate([y0[mask], y1[mask], np.full(np.sum(mask), None, dtype=object)])
+            # use midpoint of bin for display alpha
+            alpha = ((bin_edges[b] + bin_edges[b+1]) / 2.0)
+            color = f"rgba(100,100,100,{alpha})"
+            print(color)
+            fig.add_trace(go.Scatter(
+                x=xs.tolist(), y=ys.tolist(),
+                mode="lines",
+                line=dict(width=1, color=color),
+                showlegend=False,
+                name=f"edges_{alpha:.2f}",
+            ))  
+
+            # # Prepare per-edge intensity values (0..1) from weights            
+            # for (x0_, x1_, y0_, y1_, w) in zip(x0, x1, y0, y1, edge_weights):
+
+            #     alpha = float(w) * edge_opacity
+            #     color = f"rgba(100,100,100,{alpha})"
+
+            #     fig.add_trace(go.Scatter(
+            #         x=[x0_, x1_],
+            #         y=[y0_, y1_],
+            #         mode="lines",
+            #         line=dict(width=2, color=color),
+            #         showlegend=False,
+            #         name='edges',
+            #     ))
+        # except Exception:
+        #     print('Trace Fallback')
+        #     # Fallback to uniform color if per-segment coloring is not supported by the renderer
+        #     fig.add_trace(go.Scatter(
+        #         x=edge_x, y=edge_y,
+        #         mode='lines',
+        #         line=dict(width=2, color=f'rgba(100, 100, 100, {edge_opacity})'),
+        #         hoverinfo='text',
+        #         hovertext=edge_text,
+        #         showlegend=False,
+        #         name='edges',
+        #     ))
         
         # Add nodes colored by printer, one trace per printer for legend
         # Using same colors and markers as heatmap diagonal
@@ -469,7 +549,7 @@ class BookSimilarityDashboard:
             
             node_x = pos_array[node_indices, 0].tolist()
             node_y = pos_array[node_indices, 1].tolist()
-            node_text = [f"{self.books[i]}<br>Printer: {self.impr_names[i]}<br>Connections: {self.G.degree(i)}" 
+            node_text = [f"{self.books[i]}<br>Printer: {self.impr_names[i]}" 
                         for i in node_indices]
             # Show printer name as label on top of nodes
             node_labels = [impr for _ in node_indices]
@@ -499,7 +579,7 @@ class BookSimilarityDashboard:
         if len(unknown_indices) > 0:
             node_x = pos_array[unknown_indices, 0].tolist()
             node_y = pos_array[unknown_indices, 1].tolist()
-            node_text = [f"{self.books[i]}<br>Printer: Unknown<br>Connections: {self.G.degree(i)}" 
+            node_text = [f"{self.books[i]}<br>Printer: Unknown" 
                         for i in unknown_indices]
             # No label for unknown/missing printers
             node_labels = ['' for _ in unknown_indices]
@@ -874,7 +954,7 @@ class BookSimilarityDashboard:
                                         'backgroundColor': '#f4e8e8', 'border': '1px solid #a44', 'borderRadius': '3px', 'cursor': 'pointer'}),
                            ], style={'marginBottom': '5px', 'textAlign': 'center'}),
                         dcc.Graph(id='similarity-heatmap')
-                    ], style={'width': '55%', 'display': 'inline-block', 'verticalAlign': 'top'}),
+                    ], style={'flex': '0 0 55%', 'boxSizing': 'border-box'}),
                     
                     # Letter comparison panel - wider
                     html.Div([
@@ -944,8 +1024,8 @@ class BookSimilarityDashboard:
                                     html.P("Click on a cell in the similarity matrix or a node in the network graph", 
                                           style={'textAlign': 'center', 'color': 'gray', 'marginTop': '200px', 'fontSize': '14px'})
                                 ])
-                    ], style={'width': '43%', 'display': 'inline-block', 'marginLeft': '2%', 'verticalAlign': 'top'})
-                ], style={'marginBottom': '30px'}),
+                    ], style={'flex': '0 0 43%', 'boxSizing': 'border-box'})
+                ], style={'marginBottom': '30px', 'display': 'flex', 'gap': '2%', 'alignItems': 'flex-start', 'flexWrap': 'wrap'}),
                 
                 # Network graph section with controls
                 html.Div([
@@ -981,10 +1061,10 @@ class BookSimilarityDashboard:
                             dcc.Slider(
                                 id='edge-opacity-slider',
                                 min=0.0,
-                                max=0.4,
-                                step=0.02,
-                                value=0.15,
-                                marks={0: '0', 0.1: '0.1', 0.2: '0.2', 0.3: '0.3', 0.4: '0.4'},
+                                max=2.0,
+                                step=0.1,
+                                value=1.0,
+                                marks={0: '0', 0.5: '0.5', 1.0: '1.0', 1.5: '1.5', 2.0: '2.0'},
                                 tooltip={"placement": "bottom", "always_visible": False}
                             )
                         ], style={'width': '20%', 'display': 'inline-block', 'verticalAlign': 'middle', 'marginLeft': '10px'}),
@@ -1025,7 +1105,7 @@ class BookSimilarityDashboard:
                                             min=5,
                                             max=100,
                                             step=5,
-                                            value=15,
+                                            value=50,
                                             marks={5: '5', 50: '50', 100: '100'},
                                             tooltip={"placement": "bottom", "always_visible": False}
                                         )
@@ -1338,8 +1418,31 @@ class BookSimilarityDashboard:
             positions = self._compute_umap_positions(distance_matrix, n_neighbors, min_dist)
             
             if positions is not None:
-                # Cache for future use
+                # Cache for future use (manage UMAP cache size)
+                # Insert new entry
                 self._figures_cache[cache_key] = positions
+
+                # Trim only UMAP-related entries first to respect MAX_UMAP_CACHE_SIZE
+                umap_keys = [k for k in self._figures_cache.keys() if k.startswith('umap_positions_')]
+                # Keep default key if present
+                default_key = 'umap_positions_50_0.5'
+                # If too many UMAP entries, remove the oldest non-default ones
+                if len(umap_keys) > self.MAX_UMAP_CACHE_SIZE:
+                    removable = [k for k in umap_keys if k != default_key]
+                    # Remove oldest until under limit
+                    while len([k for k in self._figures_cache.keys() if k.startswith('umap_positions_')]) > self.MAX_UMAP_CACHE_SIZE and removable:
+                        key_to_remove = removable.pop(0)
+                        if key_to_remove in self._figures_cache:
+                            del self._figures_cache[key_to_remove]
+
+                # Global figure cache trim: keep total entries under MAX_FIGURE_CACHE_SIZE
+                while len(self._figures_cache) > self.MAX_FIGURE_CACHE_SIZE:
+                    # Remove oldest non-default entry
+                    for k in list(self._figures_cache.keys()):
+                        if k != default_key:
+                            del self._figures_cache[k]
+                            break
+
                 return positions.tolist()  # Convert to list for JSON serialization
             return None
         
@@ -1351,15 +1454,86 @@ class BookSimilarityDashboard:
             prevent_initial_call=True
         )
         def update_edge_opacity_only(edge_opacity, current_fig):
-            """Fast update of edge opacity without rebuilding the graph"""
             if current_fig is None:
                 return dash.no_update
-            
-            # Use Patch for efficient partial update
-            patched_fig = dash.Patch()
-            # The edge trace is always the first trace (index 0)
-            patched_fig['data'][0]['line']['color'] = f'rgba(100, 100, 100, {edge_opacity})'
-            return patched_fig
+            # Scale existing alpha values multiplicatively by `edge_opacity`.
+            # Handles binned traces named like 'edges_{alpha}', traces with
+            # `line.colorscale`, numeric `line.color` arrays, and `rgba(...)` strings.
+            if edge_opacity is None:
+                return dash.no_update
+
+            patched = dash.Patch()
+            traces = current_fig.get('data', [])
+
+            for i, trace in enumerate(traces):
+                if not trace:
+                    continue
+                name = str(trace.get('name', '') or '')
+                line = trace.get('line', {}) if isinstance(trace.get('line', {}), dict) else {}
+
+                # Binned trace naming convention: 'edges_{orig_alpha:.2f}'
+                if name.startswith('edges_'):
+                    try:
+                        orig_alpha = float(name.split('_')[-1])
+                    except Exception:
+                        orig_alpha = None
+                    if orig_alpha is not None:
+                        new_a = max(0.0, min(1.0, orig_alpha * float(edge_opacity)))
+                        # Preserve existing RGB if possible
+                        existing_color = line.get('color')
+                        if isinstance(existing_color, str) and 'rgba' in existing_color:
+                            parts = existing_color.replace('rgba(', '').replace(')', '').split(',')
+                            if len(parts) >= 3:
+                                r, g, b = parts[0].strip(), parts[1].strip(), parts[2].strip()
+                                patched['data'][i]['line']['color'] = f'rgba({r},{g},{b},{new_a})'
+                                continue
+                        # Fallback color
+                        patched['data'][i]['line']['color'] = f'rgba(100,100,100,{new_a})'
+                        continue
+
+                # If trace uses a colorscale for mapping numeric values -> update its opaque end
+                if 'colorscale' in line:
+                    try:
+                        cs = line.get('colorscale') or []
+                        # Try to extract RGB from last colorscale color
+                        rgb = (100, 100, 100)
+                        if cs and isinstance(cs, (list, tuple)) and len(cs) > 0:
+                            last = cs[-1][1]
+                            if isinstance(last, str) and 'rgba' in last:
+                                parts = last.replace('rgba(', '').replace(')', '').split(',')
+                                if len(parts) >= 3:
+                                    rgb = (int(parts[0].strip()), int(parts[1].strip()), int(parts[2].strip()))
+                        new_a = max(0.0, min(1.0, float(edge_opacity)))
+                        patched['data'][i]['line']['colorscale'] = [[0.0, f'rgba({rgb[0]},{rgb[1]},{rgb[2]}, 0)'], [1.0, f'rgba({rgb[0]},{rgb[1]},{rgb[2]},{new_a})']]
+                    except Exception:
+                        # safest fallback
+                        patched['data'][i]['line']['colorscale'] = [[0.0, 'rgba(100,100,100,0)'], [1.0, f'rgba(100,100,100,{edge_opacity})']]
+                    continue
+
+                # If line.color is a numeric array (weights) -> set/update colorscale max alpha
+                col = line.get('color', None)
+                if isinstance(col, (list, tuple)):
+                    patched['data'][i]['line']['colorscale'] = [[0.0, 'rgba(100,100,100,0)'], [1.0, f'rgba(100,100,100,{edge_opacity})']]
+                    continue
+
+                # If color is an rgba string, parse and scale its alpha
+                if isinstance(col, str) and 'rgba' in col:
+                    try:
+                        parts = col.replace('rgba(', '').replace(')', '').split(',')
+                        if len(parts) >= 3:
+                            r, g, b = parts[0].strip(), parts[1].strip(), parts[2].strip()
+                            orig_a = float(parts[3]) if len(parts) > 3 else 1.0
+                            new_a = max(0.0, min(1.0, orig_a * float(edge_opacity)))
+                            patched['data'][i]['line']['color'] = f'rgba({r},{g},{b},{new_a})'
+                            continue
+                    except Exception:
+                        patched['data'][i]['line']['color'] = f'rgba(100,100,100,{edge_opacity})'
+                        continue
+
+                # Otherwise: skip non-edge traces or unknown formats
+                # (we avoid touching node traces or unrelated items)
+
+            return patched
         
         @self.app.callback(
             Output('network-graph', 'figure', allow_duplicate=True),
@@ -1924,61 +2098,12 @@ class BookSimilarityDashboard:
                            style={'textAlign': 'center', 'color': 'gray', 'fontSize': '10px'})
                 ])
     
-    def _get_cached_images(self, book_name, letter, font_type):
-        """
-        Get all cached images for a book/letter/font combo.
-        Loads per-book pickle file on demand if not already loaded.
-        """
-        # Per-book image cache: {book_name: {(font_type, letter): [(img_path, encoded), ...]}}
-        if not hasattr(self, '_per_book_image_cache'):
-            self._per_book_image_cache = {}
-
-        # Load book's images if not already loaded
-        if book_name not in self._per_book_image_cache:
-            self._load_book_images(book_name)
-
-        book_cache = self._per_book_image_cache.get(book_name, {})
-        results = []
-        font_types = ['roman', 'italic'] if font_type == 'combined' else [font_type]
-        for ft in font_types:
-            key = (ft, letter)
-            if key in book_cache:
-                results.extend(book_cache[key])
-        return results
-
-    def _load_book_images(self, book_name):
-        """
-        Load all images for a book from its pickle file into the per-book cache.
-        Pickle file should be named images_{book_name}.pkl in the working directory.
-        """
-        import pickle
-        import os
-        if not hasattr(self, '_per_book_image_cache'):
-            self._per_book_image_cache = {}
-        filename = f"images_{book_name}.pkl"
-        if not os.path.exists(filename):
-            # No pickle file for this book
-            self._per_book_image_cache[book_name] = {}
-            return
-        try:
-            with open(filename, 'rb') as f:
-                # Should be a dict: {(font_type, letter): [(img_path, encoded), ...]}
-                self._per_book_image_cache[book_name] = pickle.load(f)
-        except Exception as e:
-            print(f"Failed to load image pickle for {book_name}: {e}")
-            self._per_book_image_cache[book_name] = {}
     
     def _encode_image(self, image_path):
-        """Get image from cache or load if not cached"""
-        # Check cache first
-        if image_path in self._image_cache:
-            return self._image_cache[image_path]
-        
-        # Fallback: load from disk if not in cache
+        """Load image directly from disk without caching"""
         try:
             with open(image_path, 'rb') as f:
                 encoded = base64.b64encode(f.read()).decode()
-            self._image_cache[image_path] = encoded
             return encoded
         except Exception:
             return ""
