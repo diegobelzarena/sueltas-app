@@ -1223,11 +1223,14 @@ class BookSimilarityDashboard:
                                style={'marginRight': '10px', 'padding': '8px 15px'}),
                     html.Button("Export Similarity Matrix (CSV)", id="export-matrix-btn", n_clicks=0,
                                style={'marginRight': '10px', 'padding': '8px 15px'}),
-                    html.Button("📄 Save as HTML", id="export-html-btn", n_clicks=0,
+                    html.Button("📄 Download HTML", id="export-html-btn", n_clicks=0,
                                style={'marginRight': '10px', 'padding': '8px 15px', 'backgroundColor': '#4CAF50', 'color': 'white', 'border': 'none', 'borderRadius': '4px'}),
                 ], style={'marginBottom': '10px'}),
                 html.Div(id="export-status")
-            ], style={'marginTop': 30, 'padding': 20, 'backgroundColor': '#f0f0f0'})
+            ], style={'marginTop': 30, 'padding': 20, 'backgroundColor': '#f0f0f0'}),
+            
+            # Download component for HTML export
+            dcc.Download(id="download-html")
         ])
     
     def _setup_callbacks(self):
@@ -1922,18 +1925,20 @@ class BookSimilarityDashboard:
                 return dash.no_update
         
         @self.app.callback(
-            Output('export-status', 'children'),
+            [Output('export-status', 'children'),
+             Output('download-html', 'data')],
             [Input('export-network-btn', 'n_clicks'),
              Input('export-matrix-btn', 'n_clicks'),
              Input('export-html-btn', 'n_clicks')],
             [State('font-type-dropdown', 'value'),
+             State('threshold-slider', 'data'),
              State('similarity-heatmap', 'figure'),
              State('network-graph', 'figure')]
         )
-        def export_data(network_clicks, matrix_clicks, html_clicks, font_type, heatmap_fig, network_fig):
+        def export_data(network_clicks, matrix_clicks, html_clicks, font_type, threshold, heatmap_fig, network_fig):
             ctx = dash.callback_context
             if not ctx.triggered:
-                return ""
+                return "", None
             
             button_id = ctx.triggered[0]['prop_id'].split('.')[0]
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1959,7 +1964,7 @@ class BookSimilarityDashboard:
                 with open(filename, 'w') as f:
                     json.dump(network_data, f, indent=2)
                 
-                return html.P(f"Network data exported to {filename}", style={'color': 'green'})
+                return html.P(f"Network data exported to {filename}", style={'color': 'green'}), None
             
             elif button_id == 'export-matrix-btn':
                 # Export similarity matrix as CSV
@@ -1974,12 +1979,25 @@ class BookSimilarityDashboard:
                 filename = f'similarity_matrix_{font_type}_{timestamp}.csv'
                 df.to_csv(filename)
                 
-                return html.P(f"Similarity matrix exported to {filename}", style={'color': 'green'})
+                return html.P(f"Similarity matrix exported to {filename}", style={'color': 'green'}), None
             
             elif button_id == 'export-html-btn':
-                # Export figures as interactive HTML
+                # Export figures as interactive HTML for download
                 try:
                     import plotly.io as pio
+                    
+                    threshold = threshold if threshold is not None else 0.1
+                    
+                    # Compute stats for export
+                    if font_type == 'roman':
+                        weight_matrix = self.w_rm
+                    elif font_type == 'italic':
+                        weight_matrix = self.w_it
+                    else:
+                        weight_matrix = (self.w_rm + self.w_it) / 2
+                    
+                    total_connections = np.sum(weight_matrix > threshold)
+                    connected_books = len(np.where(np.sum(weight_matrix > threshold, axis=0) > 0)[0])
                     
                     # Create combined HTML with both figures
                     html_content = f"""<!DOCTYPE html>
@@ -1992,14 +2010,22 @@ class BookSimilarityDashboard:
         h1 {{ text-align: center; }}
         .figure-container {{ margin: 20px 0; }}
         .info {{ background: #f0f0f0; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
+        .stats {{ background: #e8f4f8; padding: 10px; border-radius: 5px; margin-bottom: 20px; }}
     </style>
 </head>
 <body>
     <h1>Book Typography Similarity Analysis</h1>
     <div class="info">
-        <p><strong>Font Type:</strong> {font_type}</p>
+        <p><strong>Font Type:</strong> {font_type.capitalize()}</p>
+        <p><strong>Similarity Threshold:</strong> {threshold}</p>
         <p><strong>Number of Books:</strong> {len(self.books)}</p>
         <p><strong>Exported:</strong> {timestamp}</p>
+    </div>
+    <div class="stats">
+        <h3>Analysis Statistics</h3>
+        <p><strong>Total Connections (above threshold):</strong> {total_connections}</p>
+        <p><strong>Connected Books:</strong> {connected_books}</p>
+        <p><strong>Symbols Analyzed:</strong> {len(self.symbs)}</p>
     </div>
     <h2>Similarity Matrix</h2>
     <div class="figure-container" id="heatmap"></div>
@@ -2015,15 +2041,13 @@ class BookSimilarityDashboard:
 </html>"""
                     
                     filename = f'dashboard_export_{font_type}_{timestamp}.html'
-                    with open(filename, 'w', encoding='utf-8') as f:
-                        f.write(html_content)
                     
-                    return html.P(f"✅ Dashboard exported to {filename} - open in any browser!", style={'color': 'green', 'fontWeight': 'bold'})
+                    return html.P(f"✅ HTML export ready - download will start automatically!", style={'color': 'green', 'fontWeight': 'bold'}), dict(content=html_content, filename=filename)
                     
                 except Exception as e:
-                    return html.P(f"❌ Export failed: {str(e)}", style={'color': 'red'})
+                    return html.P(f"❌ Export failed: {str(e)}", style={'color': 'red'}), None
             
-            return ""
+            return "", None
         
         # Callback to show letter comparisons - shows ALL cached images instantly
         @self.app.callback(
