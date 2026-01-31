@@ -1623,7 +1623,28 @@ class BookSimilarityDashboard:
                 html.P(f"Total Connections: {total_connections}"),
                 html.P(f"Symbols Analyzed: {len(self.symbs)}")
             ]
-            if umap_changed or current_network_fig is None:
+            
+            # Handle different update scenarios
+            only_font_type_changed = triggered_inputs == ['font-type-dropdown'] and not umap_changed and current_network_fig is not None and current_heatmap_fig is not None
+            
+            if only_font_type_changed:
+                # Minimal update: patch heatmap z/title and network edges
+                heatmap_patch = dash.Patch()
+                heatmap_patch['data'][0]['z'] = n1hat_matrix if n1hat_matrix is not None else weight_matrix
+                heatmap_patch['layout']['title']['text'] = f"Book Similarity Matrix ({font_type.capitalize()})"
+                
+                # Update customdata for marker traces
+                for i in range(1, len(current_heatmap_fig['data'])):
+                    trace = current_heatmap_fig['data'][i]
+                    impr = trace['name']
+                    indices = [j for j, p in enumerate(self.impr_names) if p == impr]
+                    types = [n1hat_matrix[j, j] if n1hat_matrix is not None else weight_matrix[j, j] for j in indices]
+                    heatmap_patch['data'][i]['customdata'] = np.array(types)[:, None]
+                
+                network_patch = self._update_network_edges(current_network_fig, weight_matrix, threshold, self.edge_opacity, n1hat_matrix, umap_pos_array, font_type)
+                
+                return network_patch, heatmap_patch, stats
+            elif umap_changed or current_network_fig is None:
                 network_fig = self._create_network_graph(
                     weight_matrix, threshold, layout,
                     n_neighbors=n_neighbors, min_dist=min_dist,
@@ -1636,71 +1657,7 @@ class BookSimilarityDashboard:
                 network_fig = self._update_network_edges(current_network_fig, weight_matrix, threshold, self.edge_opacity, n1hat_matrix, umap_pos_array, font_type)
             heatmap_fig = self._get_cached_heatmap(font_type)
             return network_fig, heatmap_fig, stats
-        
-        # # Toggle shape overlays when legend items are clicked
-        # @self.app.callback(
-        #     Output('similarity-heatmap', 'figure', allow_duplicate=True),
-        #     [Input('similarity-heatmap', 'restyleData')],
-        #     [State('similarity-heatmap', 'figure')],
-        #     prevent_initial_call=True
-        # )
-        # def toggle_shape_overlays(restyle_data, current_fig):
-        #     if restyle_data is None or current_fig is None:
-        #         return dash.no_update
-            
-        #     # restyleData format: [{'visible': ['legendonly']}, [1]] means trace 1 was hidden
-        #     # or [{'visible': [True]}, [1]] means trace 1 was shown
-        #     try:
-        #         visibility_change = restyle_data[0].get('visible', None)
-        #         trace_indices = restyle_data[1] if len(restyle_data) > 1 else []
-                
-        #         if visibility_change is None or not trace_indices:
-        #             return dash.no_update
-                
-        #         # Get the trace that was toggled
-        #         traces = current_fig.get('data', [])
-        #         shapes = current_fig.get('layout', {}).get('shapes', [])
-                
-        #         if not shapes:
-        #             return dash.no_update
-                
-        #         # For each toggled trace, find its name (printer) and toggle corresponding shapes
-        #         for i, trace_idx in enumerate(trace_indices):
-        #             if trace_idx < len(traces):
-        #                 trace = traces[trace_idx]
-        #                 printer_name = trace.get('name', '')
-        #                 new_visible = visibility_change[i] if i < len(visibility_change) else visibility_change[0]
-                        
-        #                 # Check if visible - handle various formats Plotly might send
-        #                 # 'legendonly' means hidden, anything else (True, true, 1) means visible
-        #                 is_visible = new_visible not in ['legendonly', False, 'false', None]
-                        
-        #                 # Update shapes that belong to this printer
-        #                 for shape in shapes:
-        #                     shape_name = shape.get('name', '')
-        #                     if shape_name == f"overlay_{printer_name}":
-        #                         # Toggle visibility by setting opacity (preserve RGB)
-        #                         current_fill = shape.get('fillcolor', '')
-        #                         if 'rgba' in current_fill:
-        #                             parts = current_fill.replace('rgba(', '').replace(')', '').split(',')
-        #                             if len(parts) >= 3:
-        #                                 if is_visible:
-        #                                     # Restore alpha to 0.3
-        #                                     shape['fillcolor'] = f"rgba({parts[0]},{parts[1]},{parts[2]}, 0.3)"
-        #                                 else:
-        #                                     # Set alpha to 0 (keep RGB for later restore)
-        #                                     shape['fillcolor'] = f"rgba({parts[0]},{parts[1]},{parts[2]}, 0)"
-                
-        #         # Explicitly preserve layout settings to prevent margin shifts
-        #         current_fig['layout']['uirevision'] = 'constant'
-        #         current_fig['layout']['xaxis']['automargin'] = False
-        #         current_fig['layout']['yaxis']['automargin'] = False
-                
-        #         return current_fig
-                
-        #     except Exception as e:
-        #         print(f"Error toggling shapes: {e}")
-        #         return dash.no_update
+
         
         # Show/hide all printers in network graph legend
         @self.app.callback(
