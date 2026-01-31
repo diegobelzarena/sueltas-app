@@ -238,21 +238,14 @@ def load_real_data_into_dashboard(dashboard):
 
 
 
-def main():
-    """Main launcher function"""
-    
-    dashboard = BookSimilarityDashboard()
+dashboard = BookSimilarityDashboard()
+app = dashboard.app
+server = app.server
 
-    app = dashboard.app
-    server = app.server
-
-    with server.app_context():
-        load_real_data_into_dashboard(dashboard)
-
-    
-    port = int(os.environ.get("PORT", 8050))
-    app.run_server(host="0.0.0.0", port=port, debug=False)
-    
+# Load data once at startup (blocking)
+with server.app_context():
+    load_real_data_into_dashboard(dashboard)
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 8050))
+    app.run_server(host="0.0.0.0", port=port, debug=True)
