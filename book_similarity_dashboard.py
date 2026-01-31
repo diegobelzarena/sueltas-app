@@ -27,13 +27,17 @@ class BookSimilarityDashboard:
     MAX_UMAP_CACHE_SIZE = 5     # Limit cached UMAP parameter combinations
 
     def __init__(self):
-        # do nothing here, use set_data to initialize
         self.books = None
         self.w_rm = None
         self.w_it = None
-        self.app = dash.Dash(__name__)
+        self.impr_names = None
+        self.symbs = None
+        self.n1hat_rm = None
+        self.n1hat_it = None
+
+        self.app = dash.Dash(__name__, suppress_callback_exceptions=True)
         self.app.layout = html.Div("Loading data, please wait…")
-       
+        
     def set_data(self, books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it,
                  cached_order=None, figures_cache=None):
         """
@@ -142,11 +146,6 @@ class BookSimilarityDashboard:
         self.edge_opacity = 1.0
         # Save figures cache to disk for next startup
         self._save_figures_cache()
-        
-        # Initialize app with static folder for serving images
-        self.app = dash.Dash(__name__, 
-                             assets_folder='letter_images',
-                             suppress_callback_exceptions=True)
         
         # Serve images from static folder
         self.letter_images_path = './letter_images/'
@@ -971,39 +970,22 @@ class BookSimilarityDashboard:
         self.app.layout = html.Div([
             html.H1("Book Typography Similarity Analysis Dashboard", 
                    style={'textAlign': 'center', 'marginBottom': 30}),
-            
             # Control panel - Font Type selector (main control)
             html.Div([
-                html.Div([
-                    html.Label("Analysis Mode:", style={'fontSize': '16px', 'fontWeight': 'bold', 'marginRight': '15px', 'color': '#333'}),
-                    dcc.RadioItems(
-                        id='font-type-dropdown',
-                        options=[
-                            {'label': ' Combined (Roman + Italic)', 'value': 'combined'},
-                            {'label': ' Roman only', 'value': 'roman'},
-                            {'label': ' Italic only', 'value': 'italic'}
-                        ],
-                        value='combined',
-                        inline=True,
-                        inputStyle={'marginRight': '8px', 'transform': 'scale(1.2)'},
-                        labelStyle={'marginRight': '25px', 'fontSize': '14px', 'cursor': 'pointer', 'padding': '8px 12px', 
-                                   'backgroundColor': '#fff', 'borderRadius': '5px', 'border': '1px solid #ddd'}
-                    )
-                ], style={'textAlign': 'center'}),
-                html.Div([
-                    html.Label("Similarity Threshold:", style={'fontSize': '14px', 'fontWeight': 'bold', 'marginRight': '15px', 'color': '#333'}),
-                    dcc.Slider(
-                        id='threshold-slider-input',
-                        min=0.0,
-                        max=0.5,
-                        step=0.01,
-                        value=0.1,
-                        marks={0: '0', 0.1: '0.1', 0.25: '0.25', 0.5: '0.5'},
-                        tooltip={"placement": "bottom", "always_visible": False}
-                    )
-                ], style={'marginTop': '10px'}),
-                # Hidden elements to maintain compatibility - threshold updated by slider, layout always umap
-                dcc.Store(id='threshold-slider', data=0.1),
+                html.Label("Analysis Mode:", style={'fontSize': '16px', 'fontWeight': 'bold', 'marginRight': '15px', 'color': '#333'}),
+                dcc.RadioItems(
+                    id='font-type-dropdown',
+                    options=[
+                        {'label': ' Combined (Roman + Italic)', 'value': 'combined'},
+                        {'label': ' Roman only', 'value': 'roman'},
+                        {'label': ' Italic only', 'value': 'italic'}
+                    ],
+                    value='combined',
+                    inline=True,
+                    inputStyle={'marginRight': '8px', 'transform': 'scale(1.2)'},
+                    labelStyle={'marginRight': '25px', 'fontSize': '14px', 'cursor': 'pointer', 'padding': '8px 12px', 
+                               'backgroundColor': '#fff', 'borderRadius': '5px', 'border': '1px solid #ddd'}
+                ),
                 dcc.Store(id='layout-dropdown', data='umap'),
             ], style={'marginBottom': 10, 'padding': '15px 20px', 'backgroundColor': '#f0f8ff', 'borderRadius': '8px', 'border': '2px solid #4a90d9'}),
             
@@ -1237,20 +1219,12 @@ class BookSimilarityDashboard:
     def _setup_callbacks(self):
         """Setup dashboard callbacks"""
         
-        # Update threshold store when slider changes
-        @self.app.callback(
-            Output('threshold-slider', 'data'),
-            [Input('threshold-slider-input', 'value')]
-        )
-        def update_threshold_store(value):
-            return value
-        
         # Initialize letter filter and printer dropdown on load
         @self.app.callback(
             [Output('letter-filter', 'options'),
              Output('letter-filter', 'value'),
              Output('printer-filter-dropdown', 'options')],
-            [Input('threshold-slider', 'value')],  # Just trigger on load
+            [Input('font-type-dropdown', 'value')],  # Just trigger on load
             prevent_initial_call=False
         )
         def init_filters(_):
@@ -1601,8 +1575,7 @@ class BookSimilarityDashboard:
             [Output('network-graph', 'figure'),
              Output('similarity-heatmap', 'figure'),
              Output('stats-panel', 'children')],
-            [Input('threshold-slider', 'data'),
-             Input('layout-dropdown', 'data'),
+            [Input('layout-dropdown', 'data'),
              Input('font-type-dropdown', 'value'),
              Input('umap-positions-store', 'data')],
             [State('umap-n-neighbors', 'value'),
@@ -1612,13 +1585,11 @@ class BookSimilarityDashboard:
              State('network-graph', 'figure'),
              State('similarity-heatmap', 'figure')]
         )
-        def update_visualizations(threshold, layout, font_type, umap_positions, n_neighbors, min_dist, node_size, label_size, current_network_fig, current_heatmap_fig):
-            # Determine what triggered the update
+        def update_visualizations(layout, font_type, umap_positions, n_neighbors, min_dist, node_size, label_size, current_network_fig, current_heatmap_fig):
             ctx = dash.callback_context
             triggered_inputs = [t['prop_id'].split('.')[0] for t in ctx.triggered] if ctx.triggered else []
-            
-            threshold = threshold if threshold is not None else 0.1
             layout = layout if layout is not None else 'umap'
+            threshold = 0.1  # Fixed threshold, or set as desired
             if font_type == 'roman':
                 weight_matrix = self.w_rm
                 title_suffix = " (Roman)"
@@ -1641,13 +1612,9 @@ class BookSimilarityDashboard:
                 n1hat_matrix = self.n1hat_it
             else:
                 n1hat_matrix = self.n1hat_rm + self.n1hat_it
-            
-            # Check if UMAP positions changed
             umap_changed = (umap_positions is None or 
                             self._last_umap_positions is None or 
                             not np.array_equal(np.array(umap_positions), self._last_umap_positions))
-            
-            # Calculate stats (always needed)
             total_connections = np.sum(weight_matrix > threshold)
             connected_books = len(np.where(np.sum(weight_matrix > threshold, axis=0) > 0)[0])
             stats = [
@@ -1656,50 +1623,19 @@ class BookSimilarityDashboard:
                 html.P(f"Total Connections: {total_connections}"),
                 html.P(f"Symbols Analyzed: {len(self.symbs)}")
             ]
-            
-            # Handle different update scenarios
-            only_font_type_changed = triggered_inputs == ['font-type-dropdown'] and not umap_changed and current_network_fig is not None and current_heatmap_fig is not None
-            only_threshold_changed = triggered_inputs == ['threshold-slider'] and current_network_fig is not None and current_heatmap_fig is not None
-            
-            if only_font_type_changed:
-                # Minimal update: patch heatmap z/title and network edges
-                heatmap_patch = dash.Patch()
-                heatmap_patch['data'][0]['z'] = n1hat_matrix if n1hat_matrix is not None else weight_matrix
-                heatmap_patch['layout']['title']['text'] = f"Book Similarity Matrix ({font_type.capitalize()})"
-                
-                # Update customdata for marker traces
-                for i in range(1, len(current_heatmap_fig['data'])):
-                    trace = current_heatmap_fig['data'][i]
-                    impr = trace['name']
-                    indices = [j for j, p in enumerate(self.impr_names) if p == impr]
-                    types = [n1hat_matrix[j, j] if n1hat_matrix is not None else weight_matrix[j, j] for j in indices]
-                    heatmap_patch['data'][i]['customdata'] = np.array(types)[:, None]
-                
-                network_patch = self._update_network_edges(current_network_fig, weight_matrix, threshold, self.edge_opacity, n1hat_matrix, umap_pos_array, font_type)
-                
-                return network_patch, heatmap_patch, stats
-            
-            elif only_threshold_changed:
-                # Only stats change, figures stay the same
-                return current_network_fig, current_heatmap_fig, stats
-            
+            if umap_changed or current_network_fig is None:
+                network_fig = self._create_network_graph(
+                    weight_matrix, threshold, layout,
+                    n_neighbors=n_neighbors, min_dist=min_dist,
+                    umap_positions=umap_pos_array, edge_opacity=self.edge_opacity,
+                    n1hat_matrix=n1hat_matrix,
+                    marker_size=node_size, label_size=label_size, font_type=font_type
+                )
+                self._last_umap_positions = np.array(umap_positions) if umap_positions else None
             else:
-                # Full update needed
-                if umap_changed or current_network_fig is None:
-                    network_fig = self._create_network_graph(
-                        weight_matrix, threshold, layout,
-                        n_neighbors=n_neighbors, min_dist=min_dist,
-                        umap_positions=umap_pos_array, edge_opacity=self.edge_opacity,
-                        n1hat_matrix=n1hat_matrix,
-                        marker_size=node_size, label_size=label_size, font_type=font_type
-                    )
-                    self._last_umap_positions = np.array(umap_positions) if umap_positions else None
-                else:
-                    network_fig = self._update_network_edges(current_network_fig, weight_matrix, threshold, self.edge_opacity, n1hat_matrix, umap_pos_array, font_type)
-                
-                heatmap_fig = self._get_cached_heatmap(font_type)
-                
-                return network_fig, heatmap_fig, stats
+                network_fig = self._update_network_edges(current_network_fig, weight_matrix, threshold, self.edge_opacity, n1hat_matrix, umap_pos_array, font_type)
+            heatmap_fig = self._get_cached_heatmap(font_type)
+            return network_fig, heatmap_fig, stats
         
         # # Toggle shape overlays when legend items are clicked
         # @self.app.callback(
@@ -1932,11 +1868,10 @@ class BookSimilarityDashboard:
              Input('export-matrix-btn', 'n_clicks'),
              Input('export-html-btn', 'n_clicks')],
             [State('font-type-dropdown', 'value'),
-             State('threshold-slider', 'data'),
              State('similarity-heatmap', 'figure'),
              State('network-graph', 'figure')]
         )
-        def export_data(network_clicks, matrix_clicks, html_clicks, font_type, threshold, heatmap_fig, network_fig):
+        def export_data(network_clicks, matrix_clicks, html_clicks, font_type, heatmap_fig, network_fig):
             ctx = dash.callback_context
             if not ctx.triggered:
                 return "", None
