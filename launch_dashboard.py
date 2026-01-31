@@ -157,37 +157,9 @@ def load_analysis_results(force_reload=False):
             print("⚠ Symbols not found, using defaults")
             symbs = None
             
-        print(f"\nData Summary:")
-        print(f"- Books: {len(books)}")
-        print(f"- Roman matrix shape: {w_rm.shape}")
-        print(f"- Italic matrix shape: {w_it.shape}")
-        print(f"- Roman n1hat shape: {n1hat_rm.shape}")
-        print(f"- Italic n1hat shape: {n1hat_it.shape}")
-        print(f"- Roman similarity range: [{np.min(w_rm):.4f}, {np.max(w_rm):.4f}]")
-        print(f"- Italic similarity range: [{np.min(w_it):.4f}, {np.max(w_it):.4f}]")
-        print(f"- Roman connections (>0.01): {np.sum(w_rm > 0.01)}")
-        print(f"- Italic connections (>0.01): {np.sum(w_it > 0.01)}")
-        print(f"- Roman n1hat range: [{np.min(n1hat_rm):.4f}, {np.max(n1hat_rm):.4f}]")
-        print(f"- Italic n1hat range: [{np.min(n1hat_it):.4f}, {np.max(n1hat_it):.4f}]")
-        
         # Note: idxs_order will be computed by dashboard and saved later
         # Save to cache for next time (without ordering yet)
         save_to_cache(books, w_rm, w_it, impr_names, symbs, n1hat_rm=n1hat_rm, n1hat_it=n1hat_it, idxs_order=None)
-
-        # Downcast large memmap arrays to float16 view to avoid large memory usage when possible
-        try:
-            import gc
-            if hasattr(w_rm, 'dtype'):
-                w_rm = np.asarray(w_rm, dtype=np.float16)
-            if hasattr(w_it, 'dtype'):
-                w_it = np.asarray(w_it, dtype=np.float16)
-            if hasattr(n1hat_rm, 'dtype'):
-                n1hat_rm = np.asarray(n1hat_rm, dtype=np.float16)
-            if hasattr(n1hat_it, 'dtype'):
-                n1hat_it = np.asarray(n1hat_it, dtype=np.float16)
-            gc.collect()
-        except Exception:
-            pass
 
         return books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it, None, None
             
@@ -247,84 +219,40 @@ def create_sample_data():
     
     return books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it, None, None  # No cached order/figures for sample
 
-def main():
-    """Main launcher function"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Book Typography Similarity Dashboard')
-    parser.add_argument('--host', default='127.0.0.1', 
-                       help='Host address. Use 0.0.0.0 to allow remote access')
-    parser.add_argument('--port', type=int, default=8050, 
-                       help='Port number (default: 8050)')
-    parser.add_argument('--remote', action='store_true',
-                       help='Enable remote access (shortcut for --host 0.0.0.0)')
-    parser.add_argument('--threaded', action='store_true',
-                       help='Enable multi-threaded mode for better multi-user performance')
-    parser.add_argument('--reload', action='store_true',
-                       help='Force reload from .npy files (ignore cache)')
-    args = parser.parse_args()
-    
-    # For Render: always use 0.0.0.0 and get port from environment
-    host = '0.0.0.0'
-    port = int(os.environ.get('PORT', args.port))
-    
-    print("=" * 60)
-    print("Book Typography Similarity Dashboard")
-    print("=" * 60)
-    
-    # Try to load real data first
-    result = load_analysis_results(force_reload=args.reload)
+def load_real_data_into_dashboard(dashboard):
+    print("Lazy-loading analysis data...")
+
+    result = load_analysis_results(force_reload=False)
     books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it, cached_order, figures_cache = result
-    
+
     if books is None:
-        print("\nReal data not available. Using sample data for Render deployment.")
+        print("Falling back to sample data")
         books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it, cached_order, figures_cache = create_sample_data()
-    
-    # Create and launch dashboard
-    print(f"\nCreating dashboard with {len(books)} books...")
-    print(f"Roman connections: {np.sum(w_rm > 0.1)}")
-    print(f"Italic connections: {np.sum(w_it > 0.1)}")
-    
-    dashboard = BookSimilarityDashboard(
+
+    dashboard.set_data(
         books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it,
         cached_order=cached_order, figures_cache=figures_cache
     )
+
+    print("✓ Data loaded into dashboard")
+
+
+
+def main():
+    """Main launcher function"""
     
-    # Save computed data back to cache if it was freshly calculated
-    if cached_order is None and dashboard.idxs_order is not None:
-        print("Saving computed ordering to cache...")
-        save_to_cache(books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it, dashboard.idxs_order)
+    dashboard = BookSimilarityDashboard()
+
+    app = dashboard.app
+    server = app.server
+
+    with server.app_context():
+        load_real_data_into_dashboard(dashboard)
+
     
-    # Save figures cache if it was freshly computed
-    if figures_cache is None and hasattr(dashboard, '_figures_cache') and dashboard._figures_cache:
-        print("Saving computed figures to cache...")
-        save_figures_cache(dashboard._figures_cache)
+    port = int(os.environ.get("PORT", 8050))
+    app.run_server(host="0.0.0.0", port=port, debug=False)
     
-    # Get local IP for remote access info
-    local_ip = "localhost"
-    if host == '0.0.0.0':
-        import socket
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-        except:
-            local_ip = "your-ip-address"
-    
-    print("\n" + "=" * 60)
-    print(f"Dashboard starting at http://{host}:{port}")
-    print("If running on Render, your public URL will be provided by the Render dashboard.")
-    print("=" * 60)
-    
-    
-    server = dashboard.app.server  # Flask server
-    try:
-        dashboard.app.run_server(debug=False, port=port, host=host)
-    except KeyboardInterrupt:
-        print("\nDashboard stopped by user")
-    except Exception as e:
-        print(f"\nError running dashboard: {e}")
 
 if __name__ == "__main__":
     main()

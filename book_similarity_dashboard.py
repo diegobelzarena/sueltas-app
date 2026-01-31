@@ -6,7 +6,6 @@ import pandas as pd
 import numpy as np
 import networkx as nx
 from scipy.cluster.hierarchy import linkage, optimal_leaf_ordering, leaves_list
-from scipy.spatial.distance import squareform
 import json
 import base64
 import os
@@ -27,7 +26,16 @@ class BookSimilarityDashboard:
     MAX_FIGURE_CACHE_SIZE = 10  # Limit total cached figure/aux entries
     MAX_UMAP_CACHE_SIZE = 5     # Limit cached UMAP parameter combinations
 
-    def __init__(self, books, w_rm, w_it, impr_names=None, symbs=None, n1hat_rm=None, n1hat_it=None, cached_order=None, figures_cache=None):
+    def __init__(self):
+        # do nothing here, use set_data to initialize
+        self.books = None
+        self.w_rm = None
+        self.w_it = None
+        self.app = dash.Dash(__name__)
+        self.app.layout = html.Div("Loading data, please wait…")
+       
+    def set_data(self, books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it,
+                 cached_order=None, figures_cache=None):
         """
         Initialize the dashboard with your data.
         
@@ -42,9 +50,6 @@ class BookSimilarityDashboard:
             cached_order: pre-computed hierarchical ordering (optional)
             figures_cache: dict of pre-computed figures (optional)
         """
-        import time
-        init_start = time.time()
-        
         self.books = books
         self.w_rm = w_rm
         self.w_it = w_it
@@ -154,10 +159,6 @@ class BookSimilarityDashboard:
                 
         self._setup_layout()
         self._setup_callbacks()
-        
-        # Report total init time
-        init_elapsed = time.time() - init_start
-        print(f"✓ Dashboard initialized in {init_elapsed:.2f} seconds")
     
     def _load_or_create_per_book_files(self, max_per_letter=3):
         """
