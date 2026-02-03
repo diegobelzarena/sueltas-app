@@ -28,79 +28,68 @@ class BookSimilarityDashboard:
 
     def __init__(self):
         self.books = None
-        self.w_rm = None
-        self.w_it = None
         self.impr_names = None
         self.symbs = None
         self.n1hat_rm = None
         self.n1hat_it = None
+        self.top_k = 5000  # For network graphs (reduced for memory efficiency)
+        self.n_bins = 10 
+        
+        # Serve images from static folder
+        self.letter_images_path = './letter_images/'
+        self._cache_dir = './images_cache/'  # Directory for per-book cache files
+        os.makedirs(self._cache_dir, exist_ok=True)
 
         self.app = dash.Dash(__name__, suppress_callback_exceptions=True)
         self.app.layout = html.Div("Loading data, please wait…")
         
-    def set_data(self, books, w_rm, w_it, impr_names, symbs, n1hat_rm, n1hat_it,
-                 cached_order=None, figures_cache=None):
+    def set_data(self):
         """
         Initialize the dashboard with your data.
-        
-        Args:
-            books: array of book names
-            w_rm: weight matrix for romans
-            w_it: weight matrix for italics  
-            impr_names: array of imprinter names (optional)
-            symbs: array of symbols analyzed (optional)
-            n1hat_rm: n1hat matrix for romans (optional, for hover info)
-            n1hat_it: n1hat matrix for italics (optional, for hover info)
-            cached_order: pre-computed hierarchical ordering (optional)
-            figures_cache: dict of pre-computed figures (optional)
         """
-        self.books = books
-        self.w_rm = w_rm
-        self.w_it = w_it
-        self.n1hat_rm = n1hat_rm
-        self.n1hat_it = n1hat_it
-        # Reduce precision to save memory (try float16 first)
-        try:
-            self.w_rm = self.w_rm.astype(np.float16)
-            self.w_it = self.w_it.astype(np.float16)
-        except:
-            self.w_rm = self.w_rm.astype(np.float32)
-            self.w_it = self.w_it.astype(np.float32)
-        self.impr_names = impr_names if impr_names is not None else np.array([f"Unknown_{i}" for i in range(len(books))])
-        self.symbs = symbs if symbs is not None else np.array([f"symbol_{i}" for i in range(w_rm.shape[0] if len(w_rm.shape) > 2 else 26)])
         
-        # Remove isolated books
-        self.idxs_connected = np.where(np.sum((self.w_rm + self.w_it) > 0, axis=0) > 1)[0]
+        self.n1hat_it = np.load('./n1hat_it_matrix_ordered.npy')
+        self.n1hat_rm = np.load('./n1hat_rm_matrix_ordered.npy')
+        self.books = np.load('./books_dashboard_ordered.npy')
+        self.impr_names = np.load('./impr_names_dashboard_ordered.npy')
+        self.symbs = np.load('./symbs_dashboard.npy')
+        print(" Loaded ordered .npy files")
         
-        # Use cached ordering if available, otherwise compute
-        if cached_order is not None:
-            print("✓ Using cached hierarchical ordering")
-            self.idxs_order = cached_order
-        else:
-            print("Computing hierarchical ordering...")
-            metric = 1 - (self.w_rm.astype(np.float64) + self.w_it.astype(np.float64)) / 2
-            self.idxs_order = self._hierarchical_order(metric)
+        # Load weight matrices as memory-mapped arrays (not copied to RAM)
+        w_rm_mmap = np.load('./w_rm_matrix_ordered.npy', mmap_mode='r')
+        w_it_mmap = np.load('./w_it_matrix_ordered.npy', mmap_mode='r')
+        print(f" Weight matrices loaded as memory-mapped (not in RAM)")
         
-        # reorder matrices
-        self.w_rm = self.w_rm[np.ix_(self.idxs_order, self.idxs_order)]
-        self.w_it = self.w_it[np.ix_(self.idxs_order, self.idxs_order)]
-        self.books = self.books[self.idxs_order]
-        self.impr_names = self.impr_names[self.idxs_order]
-        self.n1hat_rm = self.n1hat_rm[np.ix_(self.idxs_order, self.idxs_order)]
-        self.n1hat_it = self.n1hat_it[np.ix_(self.idxs_order, self.idxs_order)]
+        # Check the dtype of n1hat_rm, n1hat_it
+        print(f"n1hat_rm dtype: {self.n1hat_rm.dtype if self.n1hat_rm is not None else 'None'}, n1hat_it dtype: {self.n1hat_it.dtype if self.n1hat_it is not None else 'None'}")
+ 
+        # Pre-compute top edges for network graphs using mmap arrays
+        self._precompute_edges(w_rm_mmap, w_it_mmap,
+                               top_k=self.top_k, n_bins=self.n_bins)
         
+        # Initialize printer markers dictionary (lightweight, no trace objects)
+        self._printer_markers = self._get_printer_colors_dict()
+                                
+        # Image cache removed for memory efficiency
+        # Images will be loaded on-demand without caching
+        self._load_metadata_for_letter_images()  # 3 images per letter
+                
+        self._setup_layout(w_combined=w_rm_mmap + w_it_mmap)
+        self._setup_callbacks()
+        
+    def _precompute_edges(self, w_rm, w_it, top_k=10000, n_bins=10):
+        """Precompute top edges for network graphs to speed up rendering."""
         # Precompute top edges and binned edges for network graphs (top 10000 by weight from each font type matrix)
         self._top_edges = {}
         self._binned_edges = {}
-        top_k = 10000
-        n_bins = 10
+        
         for font_type in ['roman', 'italic', 'combined']:
             if font_type == 'roman':
-                matrix = self.w_rm
+                matrix = w_rm
             elif font_type == 'italic':
-                matrix = self.w_it
+                matrix = w_it
             else:
-                matrix = (self.w_rm + self.w_it) / 2
+                matrix = (w_rm + w_it) / 2
             upper_mask = np.triu(np.ones_like(matrix, dtype=bool), k=1)
             edge_weights = matrix[upper_mask]
             i_indices, j_indices = np.where(upper_mask)
@@ -122,169 +111,165 @@ class BookSimilarityDashboard:
                 edges_in_bin = [self._top_edges[font_type][i] for i in indices]
                 avg_w = np.mean([matrix[i, j] for i, j in edges_in_bin]) if edges_in_bin else 0
                 self._binned_edges[font_type][bin_idx] = {'edges': edges_in_bin, 'avg_w': avg_w}
-        
-        # Cache max similarity per font type (doesn't depend on threshold)
-        self._max_similarity_cache = {
-            'roman': np.max(self.w_rm),
-            'italic': np.max(self.w_it),
-            'combined': np.max((self.w_rm + self.w_it) / 2)
-        }
-        
-        # Pre-compute printer markers for reuse
-        self._precompute_printer_markers()
-        
-        # Create base heatmap figure for reuse (with combined data)
-        combined_matrix = (self.w_rm + self.w_it) / 2
-        combined_n1hat = self.n1hat_rm + self.n1hat_it
-        self._base_heatmap_fig = self._create_heatmap(combined_matrix, combined_n1hat, "Book Similarity Matrix (Combined)", reorder=False)
-        
-        # Pre-compute figures cache
-        self._figures_cache = figures_cache if figures_cache else {}
-        self._figures_cache_file = './dashboard_figures_cache.pkl'
-        self._precompute_figures()
-        self._last_umap_positions = self._figures_cache.get('umap_positions_50_0.5', None)
-        self.edge_opacity = 1.0
-        # Save figures cache to disk for next startup
-        self._save_figures_cache()
-        
-        # Serve images from static folder
-        self.letter_images_path = './letter_images/'
-        self._cache_dir = './images_cache/'  # Directory for per-book cache files
-        os.makedirs(self._cache_dir, exist_ok=True)
-
-        # Image cache removed for memory efficiency
-        # Images will be loaded on-demand without caching
-        self._load_or_create_per_book_files(max_per_letter=3)  # 3 images per letter
-                
-        self._setup_layout()
-        self._setup_callbacks()
     
-    def _load_or_create_per_book_files(self, max_per_letter=3):
+    def _get_printer_colors_dict(self):
+        """Get lightweight printer color/marker dictionary (no trace objects)."""
+        impr_to_color, impr_to_marker, unique_imprs = self._get_printer_colors()
+        return {
+            'colors': impr_to_color,
+            'markers': impr_to_marker,
+            'unique_imprinters': unique_imprs
+        }
+    
+    def _build_printer_marker_traces(self, n1hat):
+        """Build printer marker traces on-demand for heatmap."""
+        traces = []
+        types_diag = np.diagonal(n1hat)
+        
+        for impr in self._printer_markers['unique_imprinters']:
+            mask = self.impr_names == impr
+            if not np.any(mask):
+                continue
+            
+            trace = go.Scatter(
+                x=self.books[mask],
+                y=self.books[mask],
+                mode='markers',
+                marker=dict(
+                    symbol=self._printer_markers['markers'][impr],
+                    size=6,
+                    color=self._printer_markers['colors'][impr],
+                    line=dict(color='white', width=1)
+                ),
+                showlegend=True,
+                legendgroup=impr,
+                name=impr,
+                customdata=types_diag[mask][:, None],
+                hovertemplate=f'Printer: {impr}<br>Book: %{{x}}<br>Types: %{{customdata[0]}}<extra></extra>'
+            )
+            traces.append(trace)
+        return traces
+                
+    def _load_umap_positions(self, w_combined=None, n_neighbors=50, min_dist=0.5):
+        
+        # if file exists, load it
+        umap_file = f'./umap_{n_neighbors}_{min_dist}.npy'
+        if os.path.exists(umap_file):
+            umap_positions = np.load(umap_file)
+            print(f"✓ Loaded UMAP positions from {umap_file}")
+        else:
+            print("Computing UMAP positions...")
+            umap_positions = self._compute_umap_positions(1 - (w_combined.astype(np.float64)),
+                                                            n_neighbors=n_neighbors,
+                                                            min_dist=min_dist)
+            np.save(umap_file, umap_positions)
+            print(f"✓ Saved UMAP positions to {umap_file}")
+            
+        print(f"UMAP positions shape: {umap_positions.shape}")
+        return umap_positions
+        
+    def _create_heatmap(self):
+        """Create similarity matrix heatmap matching notebook style"""     
+           
+        n1hat = self.n1hat_rm + self.n1hat_it # Combined n1hat for hover info
+        n_books = len(self.books)
+        
+        # Create the main heatmap
+        # Prepare customdata: for each cell, [impr_y, impr_x] (vectorized)
+        missing_mask = np.isin(self.impr_names, ['n. nan', 'm. missing'])
+        customdata = np.empty((n_books, n_books, 2), dtype=object)
+        # For rows (y): repeat for each column
+        customdata[:, :, 0] = np.where(missing_mask[:, None], '', self.impr_names[:, None])
+        # For columns (x): repeat for each row
+        customdata[:, :, 1] = customdata[:, :, 0] # Same as rows since square matrix
+
+
+        fig = go.Figure(data=go.Heatmap(
+            z=n1hat,
+            x=self.books,
+            y=self.books,
+            colorscale='viridis',  # Match notebook colormap
+            reversescale=False,    # Don't reverse (notebook doesn't)
+            customdata=customdata,
+            hoverongaps=False,
+            hovertemplate=(
+                'Book 1: %{y} (%{customdata[0]})<br>'
+                'Book 2: %{x} (%{customdata[1]})<br>'
+                'Shared Types: %{z:.0f}<extra></extra>'
+            ),
+            showscale=False  # Hide colorbar to avoid legend overlap
+        ))
+        
+
+        # Add printer marker traces (built on-demand for memory efficiency)
+        marker_traces = self._build_printer_marker_traces(n1hat)
+        for trace in marker_traces:
+            fig.add_trace(trace)
+        
+        # Clean layout - responsive sizing, no tick labels
+        fig.update_layout(
+            title=None,
+            autosize=True,
+            uirevision='constant',  # Preserve zoom/pan state and prevent layout recalculation
+            xaxis=dict(
+                title="",
+                side="bottom",
+                showgrid=False,
+                showticklabels=False,  # Hide tick labels
+                automargin=False,
+                fixedrange=False,  # Allow zooming
+                constrain='domain',
+                categoryorder='array',
+                categoryarray=self.books
+            ),
+            yaxis=dict(
+                title="",
+                showgrid=False,
+                showticklabels=False,  # Hide tick labels
+                autorange='reversed',  # Match notebook orientation
+                constrain="domain",
+                automargin=False,
+                fixedrange=False,  # Allow zooming
+                categoryorder='array',
+                categoryarray=self.books,
+                scaleanchor="x",  # Lock aspect ratio to x
+                scaleratio=1     # 1:1 aspect ratio (square)
+            ),
+            margin=dict(l=25, r=25, t=15, b=15),  # Minimal margins, small space for legend
+            plot_bgcolor='#F8F5EC',
+            paper_bgcolor='#F8F5EC',
+            # Legend configuration - horizontal at bottom, compact
+            legend=dict(
+                title=dict(
+                    text="<b>Printers:</b>",
+                    font=dict(size=10, family="Inter, Arial, sans-serif", color="#887C57"),
+                    side="left"
+                ),
+                orientation="h",  # Horizontal layout
+                xanchor='center',
+                x=0.5,
+                y=0.02,
+                yanchor='top',
+                bgcolor="rgba(248,245,236,0.9)",
+                borderwidth=0,
+                font=dict(size=9, family="Inter, Arial, sans-serif", color="#374151"),
+                itemclick="toggle",
+                tracegroupgap=1,
+            )
+        )
+        
+        return fig
+    
+    
+    def _load_metadata_for_letter_images(self):
         """
         Build per-book image pickle files if missing, and load global metadata (all_letters).
         """
-        start = time.time()
-
         # Check if per-book pickle files exist for all books
-        missing_books = []
-        for book in self.books:
-            book_pkl = f"{self._cache_dir}/images_{book}.pkl"
-            if not os.path.exists(book_pkl):
-                missing_books.append(book)
-
-        if missing_books:
-            print(f"Building per-book image pickle files for {len(missing_books)} books...")
-            # Build image per-book files
-            self._build_image_cache(max_per_letter)
-        else:
-            print("✓ All per-book image caches found. Loading metadata...")
-            # Load general metadata (book_index, etc.)
-            try:
-                with open(f'{self._cache_dir}/images_cache_meta.pkl', 'rb') as f:
-                    self.meta = pickle.load(f)
-                self._all_letters = self.meta.get('all_letters', [])
-                print(f"  ✓ Loaded metadata from images_cache_meta.pkl ({len(self._all_letters)} letters)")
-            except Exception as e:
-                print(f"  ✗ Failed to load images_cache_meta.pkl: {e}")
-    
-        
-    def _build_image_cache(self, max_per_letter=3):
-        """Build per-book image pickle files from letter_images folder"""
-        import time
-        from concurrent.futures import ThreadPoolExecutor
-        start = time.time()
-        
-        if not os.path.exists(self.letter_images_path):
-            print(f"Warning: {self.letter_images_path} not found")
-            return
-        
-        # Get all PNG files
-        all_images = glob.glob(os.path.join(self.letter_images_path, '*.png'))
-        print(f"Found {len(all_images)} total images")
-        
-        # Group by book_font_letter to limit per letter
-        grouped = {}
-        for img_path in all_images:
-            filename = os.path.basename(img_path)
-            parts = filename.split('_')
-            if len(parts) >= 4:
-                key = '_'.join(parts[:-1])
-                if key not in grouped:
-                    grouped[key] = []
-                grouped[key].append(img_path)
-        
-        # Build per-book image cache and metadata
-        # Group images by book, font, letter
-        book_index = {}
-        book_img_dict = {}
-        for img_path in all_images:
-            filename = os.path.basename(img_path)
-            parts = filename.split('_')
-            if len(parts) >= 4:
-                number = parts[-1].split('.')[0]
-                letter_part = parts[-2]
-                font = parts[-3]
-                book = '_'.join(parts[:-3])
-                # Handle case-safe format
-                if letter_part.startswith('upper-'):
-                    letter = letter_part[6:]
-                elif letter_part.startswith('lower-'):
-                    letter = letter_part[6:]
-                else:
-                    letter = letter_part
-                # Build book_img_dict for limiting per letter
-                key = (book, font, letter)
-                if key not in book_img_dict:
-                    book_img_dict[key] = []
-                book_img_dict[key].append(img_path)
-        # For each book, collect images, encode, and save pickle
-        books = set([k[0] for k in book_img_dict.keys()])
-        all_letters = set()
-        for book in books:
-            book_data = {}
-            available = set()
-            # For each (font, letter) in this book
-            for (b, font, letter), paths in book_img_dict.items():
-                if b != book:
-                    continue
-                # Limit to max_per_letter
-                selected_paths = sorted(paths)[:max_per_letter]
-                # Encode images
-                encoded_imgs = []
-                for img_path in selected_paths:
-                    try:
-                        with open(img_path, 'rb') as f:
-                            encoded = base64.b64encode(f.read()).decode()
-                        encoded_imgs.append((img_path, encoded))
-                    except:
-                        continue
-                if encoded_imgs:
-                    book_data[(font, letter)] = encoded_imgs
-                    available.add((font, letter))
-                    all_letters.add(letter)
-            # Save pickle for this book
-            book_pkl = os.path.join(self._cache_dir, f"images_{book}.pkl")
-            try:
-                with open(book_pkl, 'wb') as f:
-                    pickle.dump(book_data, f)
-                print(f"  ✓ Saved {book_pkl} ({len(book_data)} keys)")
-            except Exception as e:
-                print(f"  ✗ Failed to save {book_pkl}: {e}")
-            # Save available (font, letter) for metadata
-            book_index[book] = sorted(list(available))
-        # Save all unique letters with at least one image
-        self._all_letters = sorted(all_letters, key=lambda x: (not x.isupper(), x.lower(), x))
-        # Save general metadata file
-        self.meta = {'book_index': book_index, 'all_letters': self._all_letters}
-        meta_file = os.path.join(self._cache_dir, 'images_cache_meta.pkl')
-        try:
-            with open(meta_file, 'wb') as f:
-                pickle.dump(self.meta, f)
-            print(f"  ✓ Saved {meta_file} (metadata for {len(book_index)} books, {len(self._all_letters)} letters)")
-        except Exception as e:
-            print(f"  ✗ Failed to save {meta_file}: {e}")
-        elapsed = time.time() - start
-        print(f"Built and saved per-book caches and metadata in {elapsed:.2f} seconds")
+        with open(f'{self._cache_dir}/images_cache_meta.pkl', 'rb') as f:
+            self.meta = pickle.load(f)
+        self._all_letters = self.meta.get('all_letters', [])
+        print(f"  ✓ Loaded metadata from images_cache_meta.pkl ({len(self._all_letters)} letters)")
     
     def _hierarchical_order(self, distance_matrix):
         """Create hierarchical ordering of books"""
@@ -310,169 +295,10 @@ class BookSimilarityDashboard:
             from scipy.cluster.hierarchy import leaves_list
             leaf_order = leaves_list(optimal_order)
             
-            print(f"Hierarchical order computed: {leaf_order}")  # Debugging print
             return leaf_order
         except Exception as e:
             print(f"Warning: Hierarchical ordering failed ({e}), using default order")
             return np.arange(len(distance_matrix))
-    
-    def _precompute_figures(self):
-        """Pre-compute and cache essential data for heatmaps and network graphs."""
-        import time
-
-# Check if essential data or figures are already cached (support old and new formats)
-        cached_available = (
-            ('umap_positions_50_0.5' in self._figures_cache)
-            )
-        
-        if cached_available:
-            print("✓ Using cached figures/data (heatmaps + networks)")
-            return
-
-        print("Pre-computing essential data...")
-        start = time.time()
-
-        # Cache network graph data (adjacency matrix + positions)
-        default_threshold = 0.1
-        default_layout = 'umap'
-        umap_positions = self._compute_umap_positions(1 - (self.w_rm.astype(np.float64) + self.w_it.astype(np.float64)) / 2)  # Default UMAP positions
-
-        if 'umap_positions_50_0.5' not in self._figures_cache:
-            print("  - Caching combined network data...")
-            # Store default UMAP positions (ensure small memory footprint)
-            self._figures_cache['umap_positions_50_0.5'] = umap_positions
-            # Trim figures cache if it grows beyond MAX_FIGURE_CACHE_SIZE
-            while len(self._figures_cache) > self.MAX_FIGURE_CACHE_SIZE:
-                # Remove the oldest non-default entry
-                for k in list(self._figures_cache.keys()):
-                    if k != 'umap_positions_50_0.5':
-                        del self._figures_cache[k]
-                        break
-            
-        elapsed = time.time() - start
-        print(f"✓ Essential data cached in {elapsed:.2f} seconds")
-
-    def _precompute_printer_markers(self):
-        """Precompute printer marker positions and colors for reuse."""
-        impr_to_color, impr_to_marker, unique_imprs = self._get_printer_colors()
-        self._printer_markers = {
-            'colors': impr_to_color,
-            'markers': impr_to_marker,
-            'unique_imprinters': unique_imprs
-        }
-        
-        # Precompute marker traces for heatmaps (positions are fixed due to hierarchical ordering)
-        self._printer_marker_traces = []
-        if self.impr_names is not None:
-            # Use the ordered impr_names and books (fixed order)
-            ordered_impr = self.impr_names
-            labels = [f'{book}' for book in self.books]  # Same labels for all heatmaps
-            
-            # Get all indices for each printer
-            printer_indices = {}
-            for impr in unique_imprs:
-                indices = [i for i, p in enumerate(ordered_impr) if p == impr]
-                if indices:
-                    printer_indices[impr] = indices
-            
-            # Create scatter traces for each printer
-            for impr, indices in printer_indices.items():
-                marker_info = {
-                    'marker': impr_to_marker[impr],
-                    'color': impr_to_color[impr]
-                }
-                # Positions are the same for all heatmaps
-                x_positions = [labels[i] for i in indices]
-                y_positions = [labels[i] for i in indices]
-                # For customdata, we'll use a placeholder since n1hat varies; update when adding to figure
-                customdata = np.array([0] * len(indices))[:, None]  # Placeholder
-                
-                trace = go.Scatter(
-                    x=x_positions,
-                    y=y_positions,
-                    mode='markers',
-                    marker=dict(
-                        symbol=marker_info['marker'],
-                        size=10,
-                        color=marker_info['color'],
-                        line=dict(color='white', width=1)
-                    ),
-                    showlegend=True,
-                    legendgroup=impr,
-                    name=impr,
-                    customdata=customdata,
-                    hovertemplate=f'Printer: {impr}<br>Book: %{{x}}<br>Types: %{{customdata[0]}}<extra></extra>'
-                )
-                self._printer_marker_traces.append(trace)
-
-    
-    def _rebuild_heatmap(self, font_type, title):
-        """Update the base heatmap figure with new data."""
-        if font_type == 'combined':
-            matrix = (self.w_rm + self.w_it) / 2
-            n1hat = self.n1hat_rm + self.n1hat_it
-        elif font_type == 'roman':
-            matrix = self.w_rm
-            n1hat = self.n1hat_rm
-        else:
-            matrix = self.w_it
-            n1hat = self.n1hat_it
-
-        # Update the base figure's z data
-        self._base_heatmap_fig.data[0].z = n1hat if n1hat is not None else matrix
-        
-        # Update title
-        self._base_heatmap_fig.update_layout(title=dict(text=title, x=0.5, font=dict(size=18)))
-        
-        # Update customdata for marker traces
-        for i in range(1, len(self._base_heatmap_fig.data)):
-            trace = self._base_heatmap_fig.data[i]
-            impr = trace.name
-            indices = [j for j, p in enumerate(self.impr_names) if p == impr]
-            types = [n1hat[j, j] if n1hat is not None else matrix[j, j] for j in indices]
-            trace.customdata = np.array(types)[:, None]
-        
-        return self._base_heatmap_fig
-
-    
-    def _save_figures_cache(self):
-        """Save figures cache to disk"""
-        import pickle
-        from datetime import datetime
-        try:
-            # Trim cache before saving to keep disk cache small
-            default_key = 'umap_positions_50_0.5'
-            while len(self._figures_cache) > self.MAX_FIGURE_CACHE_SIZE:
-                for k in list(self._figures_cache.keys()):
-                    if k != default_key:
-                        del self._figures_cache[k]
-                        break
-
-            cache_data = {
-                'data': self._figures_cache,  # Now contains essential data, not full figures
-                'cached_at': datetime.now().isoformat(),
-                'version': '1.2'
-            }
-            with open(self._figures_cache_file, 'wb') as f:
-                pickle.dump(cache_data, f)
-            print(f"✓ Saved figures cache ({len(self._figures_cache)} items)")
-        except Exception as e:
-            print(f"⚠ Failed to save figures cache: {e}")
-    
-    def _get_initial_umap_positions(self):
-        """Get initial UMAP positions from cache for default parameters"""
-        default_cache_key = 'umap_positions_50_0.5'
-        if default_cache_key in self._figures_cache:
-            positions = self._figures_cache[default_cache_key]
-            print(f"✓ Initializing UMAP store from cache ({len(positions)} positions)")
-            return positions.tolist() if hasattr(positions, 'tolist') else positions
-        return None
-    
-    def _get_cached_heatmap(self, font_type):
-        """Get heatmap by rebuilding from cached data or return cached figure"""
-        
-        title = f"Book Similarity Matrix ({font_type.capitalize()})"
-        return self._rebuild_heatmap(font_type, title)
 
     
     def _compute_umap_positions(self, distance_matrix, n_neighbors=50, min_dist=0.5, random_state=42):
@@ -503,8 +329,8 @@ class BookSimilarityDashboard:
                        if impr not in ['n. nan', 'm. missing', 'Unknown']]
         
         # Use SAME colors and markers as heatmap diagonal markers
-        markers = ['circle', 'square', 'diamond']
-        colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F']
+        markers = ['circle', 'square', 'triangle-up']
+        colors = ["#C93232", "#34B5AC", "#1D4C57", "#21754E", "#755D11", "#772777", "#DFB13D", "#C9459F", "#F09D55", "#487BA0", "#6A3A3A", "#5AAE54", "#B15928"]
         
         impr_to_color = {}
         impr_to_marker = {}
@@ -521,23 +347,34 @@ class BookSimilarityDashboard:
         impr_to_marker['Unknown'] = 'x'
         
         return impr_to_color, impr_to_marker, unique_imprs
+    
+    def _get_book_color(self, book_name):
+        """Get color for a specific book from predefined color list"""
+        colors = ["#C93232", "#34B5AC", "#1D4C57", "#21754E", "#755D11", "#772777", "#DFB13D", "#C9459F", "#F09D55", "#487BA0", "#6A3A3A", "#5AAE54", "#B15928"]
+        book_list = list(self.books)
+        if book_name in book_list:
+            book_idx = book_list.index(book_name)
+            return colors[book_idx % len(colors)]
+        return colors[0]  # Default to first color
 
-    def _create_network_graph(self, weight_matrix, threshold=0.1, layout_type='umap',
-                         n_neighbors=50, min_dist=0.5, umap_positions=None, edge_opacity=1.0, n1hat_matrix=None,
-                         marker_size=12, label_size=8, font_type='combined'):
-        """Create network graph from weight matrix with UMAP positioning and printer colors"""
+    def _create_network_graph(self, umap_positions=None, edge_opacity=1.0,marker_size=12,
+                              label_size=8, font_type='combined'):
+        """Create network graph from weight matrix with UMAP positioning and printer colors
+        
+        Args:
+            umap_positions: numpy array or list of UMAP coordinates (will be converted if needed)
+        """
         
         # Use precomputed top edges
         edges = self._top_edges[font_type]
-        edge_weights = np.array([weight_matrix[i, j] for i, j in edges])
-        
-        edges_array = np.array(edges)  # For vectorized operations
+        # Use asarray to avoid copying if already an array
+        umap_positions = np.asarray(umap_positions, dtype=np.float32)
         
         if not edges:
-            print(f"Warning: No edges found. Max similarity: {np.max(weight_matrix):.4f}")
+            print(f"Warning: No edges found.")
             fig = go.Figure()
             fig.add_annotation(
-                text=f"No connections<br>Max similarity: {np.max(weight_matrix):.4f}",
+                text=f"No connections<br>",
                 xref="paper", yref="paper",
                 x=0.5, y=0.5, xanchor='center', yanchor='middle',
                 showarrow=False, font=dict(size=16)
@@ -545,33 +382,12 @@ class BookSimilarityDashboard:
             fig.update_layout(title="No Network Connections Found")
             return fig
         
-        
-        # Calculate layout positions
-        if layout_type == 'umap' and UMAP_AVAILABLE:
-            if umap_positions is not None:
-                # Use provided positions
-                pos = {i: umap_positions[i] for i in range(len(self.books))}
-            else:
-                # Compute UMAP positions from distance matrix
-                distance_matrix = 1 - ((self.w_rm + self.w_it) / 2)  # Convert similarity to distance
-                np.fill_diagonal(distance_matrix, 0)
-                print("Computing UMAP positions for network layout...", umap_positions)
-                positions = self._compute_umap_positions(distance_matrix, n_neighbors, min_dist)
-                if positions is not None:
-                    pos = {i: positions[i] for i in range(len(self.books))}
-                else:
-                    pos = None
-        else:
-            pos = None  # Will use spring layout
-        
+                
         # Get printer colors and markers (matching heatmap)
         impr_to_color = self._printer_markers['colors']
         impr_to_marker = self._printer_markers['markers']
         unique_imprs = self._printer_markers['unique_imprinters']
-        
-        # Convert pos to array for vectorized operations
-        pos_array = np.array([pos[i] for i in range(len(pos))])
-        impr_array = np.array(self.impr_names)
+                
         
         # Create figure
         fig = go.Figure()
@@ -587,8 +403,8 @@ class BookSimilarityDashboard:
             x_all = []
             y_all = []
             for i, j in edges_in_bin:
-                x0, y0 = pos_array[i]
-                x1, y1 = pos_array[j]
+                x0, y0 = umap_positions[i]
+                x1, y1 = umap_positions[j]
                 x_all.extend([x0, x1, None])
                 y_all.extend([y0, y1, None])
             opacity = min(1.0, avg_w * edge_opacity)
@@ -604,20 +420,48 @@ class BookSimilarityDashboard:
                 hoverinfo='skip'
             ))
         
+        # Add nodes for unknown/missing printers with 0.5 alpha and no label
+        unknown_mask = np.isin(self.impr_names, ['n. nan', 'm. missing', 'Unknown'])
+        if np.any(unknown_mask):
+            node_x = umap_positions[unknown_mask][:, 0].tolist()
+            node_y = umap_positions[unknown_mask][:, 1].tolist()
+            node_text = [f"{bk}<br>Printer: Unknown" 
+                        for bk in self.books[unknown_mask]]
+            # No label for unknown/missing printers
+            node_labels = ['' for _ in range(unknown_mask.sum())]
+            
+            fig.add_trace(go.Scatter(
+                x=node_x, y=node_y,
+                mode='markers+text',
+                marker=dict(
+                    symbol='circle',  # Circle marker for unknown
+                    size=int(marker_size * 1 / 2),
+                    color='rgba(128, 128, 128, 0.5)',  # 0.5 alpha
+                    line=dict(width=1, color='white')
+                ),
+                text=node_labels,
+                textposition='top center',
+                textfont=dict(size=int(label_size * 1 / 2), color='rgba(128, 128, 128, 0.5)'),
+                hovertemplate='%{customdata}<extra></extra>',
+                customdata=node_text,
+                name='Unknown',
+                legendgroup='Unknown',
+                showlegend=True
+            ))
 
         # Add nodes colored by printer, one trace per printer for legend
         # Using same colors and markers as heatmap diagonal
         for impr in unique_imprs:
-            node_indices = np.where(impr_array == impr)[0]
-            if len(node_indices) == 0:
+            node_mask = self.impr_names == impr
+            if not np.any(node_mask):
                 continue
             
-            node_x = pos_array[node_indices, 0].tolist()
-            node_y = pos_array[node_indices, 1].tolist()
+            node_x = umap_positions[node_mask][:, 0].tolist()
+            node_y = umap_positions[node_mask][:, 1].tolist()
             node_text = [f"{self.books[i]}<br>Printer: {self.impr_names[i]}" 
-                        for i in node_indices]
+                        for i in np.where(node_mask)[0]]
             # Show printer name as label on top of nodes
-            node_labels = [impr for _ in node_indices]
+            node_labels = [impr for _ in np.where(node_mask)[0]]
             
             fig.add_trace(go.Scatter(
                 x=node_x, y=node_y,
@@ -630,7 +474,11 @@ class BookSimilarityDashboard:
                 ),
                 text=node_labels,
                 textposition='top center',
-                textfont=dict(size=label_size, color=impr_to_color[impr]),
+                textfont=dict(
+                    size=label_size, 
+                    color=impr_to_color[impr],
+                    family='Arial, bold'  # Bold font
+                ),
                 hovertemplate='%{customdata}<extra></extra>',
                 customdata=node_text,
                 name=impr,
@@ -638,69 +486,60 @@ class BookSimilarityDashboard:
                 showlegend=True
             ))
         
-        # Add nodes for unknown/missing printers with 0.5 alpha and no label
-        unknown_mask = np.isin(impr_array, ['n. nan', 'm. missing', 'Unknown'])
-        unknown_indices = np.where(unknown_mask)[0]
-        if len(unknown_indices) > 0:
-            node_x = pos_array[unknown_indices, 0].tolist()
-            node_y = pos_array[unknown_indices, 1].tolist()
-            node_text = [f"{self.books[i]}<br>Printer: Unknown" 
-                        for i in unknown_indices]
-            # No label for unknown/missing printers
-            node_labels = ['' for _ in unknown_indices]
-            
-            fig.add_trace(go.Scatter(
-                x=node_x, y=node_y,
-                mode='markers+text',
-                marker=dict(
-                    symbol='circle',  # Circle marker for unknown
-                    size=int(marker_size * 5 / 6),
-                    color='rgba(128, 128, 128, 0.5)',  # 0.5 alpha
-                    line=dict(width=1, color='white')
-                ),
-                text=node_labels,
-                textposition='top center',
-                textfont=dict(size=int(label_size * 5 / 6), color='rgba(128, 128, 128, 0.5)'),
-                hovertemplate='%{customdata}<extra></extra>',
-                customdata=node_text,
-                name='Unknown',
-                legendgroup='Unknown',
-                showlegend=True
-            ))
         
         fig.update_layout(
-            title=dict(text='Book Similarity Network', x=0.5, font=dict(size=16)),
+            title=None,
             showlegend=True,
             legend=dict(
-                title=dict(text="Printers", font=dict(size=14)),
+                title=dict(
+                    text="<span style='font-weight:600'>  Printers  </span>",
+                    font=dict(size=13, family="Inter, Arial, sans-serif", color="#887C57")
+                ),
                 x=1.02,
                 y=1,
-                bgcolor='rgba(255,255,255,0.9)',
-                bordercolor='gray',
+                bgcolor="#F8F5EC",
+                bordercolor="#d1c7ad",
                 borderwidth=1,
-                font=dict(size=11)
+                font=dict(size=11, family="Inter, Arial, sans-serif", color="#374151"),
+                itemclick="toggle",
+                tracegroupgap=1,
+                itemsizing="constant"
+
             ),
-            hovermode='closest',
-            margin=dict(b=20, l=5, r=150, t=40),
-            annotations=[dict(
-                text="Node color/marker = printer (matching matrix), Edge opacity controlled by slider",
-                showarrow=False,
-                xref="paper", yref="paper",
-                x=0.005, y=-0.002,
-                xanchor='left', yanchor='bottom',
-                font=dict(color="gray", size=10)
-            )],
-            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, scaleanchor='y'),
+            hovermode="closest",
+            margin=dict(b=20, l=5, r=160, t=20),
+            annotations=[
+                dict(
+                    text="Node color = printer · Edge opacity controlled by slider",
+                    showarrow=False,
+                    xref="paper",
+                    yref="paper",
+                    x=0.005,
+                    y=-0.02,
+                    xanchor="left",
+                    yanchor="bottom",
+                    font=dict(
+                        color="#6b7280",
+                        size=10,
+                        family="Inter, Arial, sans-serif"
+                    ),
+                )
+            ],
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, scaleanchor="y"),
             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            plot_bgcolor='white',
-            paper_bgcolor='white'
+            plot_bgcolor="#F8F5EC",
+            paper_bgcolor="#F8F5EC",
         )
+
         
-        self._last_umap_positions = pos
         return fig
     
-    def _update_network_edges(self, current_fig, weight_matrix, threshold, edge_opacity, n1hat_matrix, umap_pos_array, font_type):
-        """Update edge traces in the network figure for new weight_matrix and threshold, keeping node traces."""
+    def _update_network_edges(self, current_fig, edge_opacity, umap_pos_array, font_type):
+        """Update edge traces in the network figure for new weight_matrix and threshold, keeping node traces.
+        
+        Args:
+            umap_pos_array: numpy array of UMAP positions (not list)
+        """
         # Use binned edges for the font type
         bins = self._binned_edges.get(font_type, {})
         
@@ -805,217 +644,177 @@ class BookSimilarityDashboard:
 
         return sorted(images, key=extract_number)
     
-    def _create_heatmap(self, matrix, n1hat, title="Similarity Matrix", reorder=False):
-        """Create similarity matrix heatmap matching notebook style"""
-        
-        try:
-            if reorder and hasattr(self, 'idxs_order') and self.idxs_order is not None:
-                # Ensure idxs_order is 1D and contains valid indices
-                if self.idxs_order.ndim == 1 and np.all(self.idxs_order < len(self.books)):
-                    start_time = time.perf_counter()
-                    ordered_matrix = matrix[np.ix_(self.idxs_order, self.idxs_order)]
-                    elapsed_time = time.perf_counter() - start_time
-                    print(f"[PROFILE] Matrix reordering: Time elapsed: {elapsed_time:.4f}s")
-
-                    start_time = time.perf_counter()
-                    ordered_books = self.books[self.idxs_order]
-                    elapsed_time = time.perf_counter() - start_time
-                    print(f"[PROFILE] Books reordering: Time elapsed: {elapsed_time:.4f}s")
-
-                    start_time = time.perf_counter()
-                    ordered_impr = self.impr_names[self.idxs_order] if self.impr_names is not None else None
-                    elapsed_time = time.perf_counter() - start_time
-                    print(f"[PROFILE] Imprinters reordering: Time elapsed: {elapsed_time:.4f}s")
-
-                    start_time = time.perf_counter()
-                    ordered_n1hat = n1hat[np.ix_(self.idxs_order, self.idxs_order)] if n1hat is not None else None
-                    elapsed_time = time.perf_counter() - start_time
-                    print(f"[PROFILE] N1hat reordering: Time elapsed: {elapsed_time:.4f}s")
-                else:
-                    print(f"Warning: Invalid idxs_order shape {self.idxs_order.shape}, using default order")
-                    ordered_matrix = matrix
-                    ordered_books = self.books
-                    ordered_impr = self.impr_names
-                    ordered_n1hat = n1hat
-            else:
-                ordered_matrix = matrix
-                ordered_books = self.books
-                ordered_impr = self.impr_names
-                ordered_n1hat = n1hat
-
-            # Create labels in notebook format: "book | imprinter"
-            if ordered_impr is not None:
-                start_time = time.perf_counter()
-                labels = [f'{book}' for book in ordered_books]
-                elapsed_time = time.perf_counter() - start_time
-                print(f"[PROFILE] Label creation: Time elapsed: {elapsed_time:.4f}s")
-            else:
-                labels = ordered_books
-                
-        except Exception as e:
-            print(f"Warning: Error in reordering ({e}), using default order")
-            ordered_matrix = matrix
-            ordered_books = self.books
-            ordered_impr = self.impr_names
-            ordered_n1hat = n1hat
-            if ordered_impr is not None:
-                labels = [f'{book}' for book in ordered_books]
-            else:
-                labels = ordered_books
-
-        # Create discrete colormap matching notebook style
-        vmin = ordered_n1hat.min()
-        vmax = ordered_n1hat.max()
-        
-        n_books = len(labels)
-        
-        # Create the main heatmap
-        # Prepare customdata: for each cell, [impr_y, impr_x] (vectorized)
-        if ordered_impr is not None:
-            impr_array = np.array(ordered_impr)
-            missing_mask = np.isin(impr_array, ['n. nan', 'm. missing'])
-            customdata = np.empty((len(labels), len(labels), 2), dtype=object)
-            # For rows (y): repeat for each column
-            customdata[:, :, 0] = np.where(missing_mask[:, None], '', impr_array[:, None])
-            # For columns (x): repeat for each row
-            customdata[:, :, 1] = np.where(missing_mask[None, :], '', impr_array[None, :])
-        else:
-            customdata = None
-
-        fig = go.Figure(data=go.Heatmap(
-            z=ordered_n1hat if ordered_n1hat is not None else ordered_matrix,
-            x=labels,
-            y=labels,
-            colorscale='viridis',  # Match notebook colormap
-            reversescale=False,    # Don't reverse (notebook doesn't)
-            customdata=customdata,
-            hoverongaps=False,
-            hovertemplate=(
-                'Book 1: %{y} (%{customdata[0]})<br>'
-                'Book 2: %{x} (%{customdata[1]})<br>'
-                'Shared Types: %{z:.0f}<extra></extra>'
-            ),
-            showscale=False  # Hide colorbar to avoid legend overlap
-        ))
-        
-        # Add precomputed printer marker traces
-        if ordered_impr is not None and hasattr(self, '_printer_marker_traces'):
-            for trace in self._printer_marker_traces:
-                impr = trace.name
-                indices = [i for i, p in enumerate(ordered_impr) if p == impr]
-                types = [ordered_n1hat[i, i] if ordered_n1hat is not None else ordered_matrix[i, i] for i in indices]
-                trace.customdata = np.array(types)[:, None]
-                fig.add_trace(trace)
-        
-        # Calculate figure size for web viewing - ensure square aspect ratio
-        base_size = max(700, min(1000, n_books * 25))  # Scale with books, web-optimized
-        fig_height = base_size
-        fig_width = base_size  # Keep exactly square
-        
-        # Clean layout matching notebook style exactly
-        fig.update_layout(
-            title=dict(text=title, x=0.5, font=dict(size=18)),
-            width=fig_width,
-            height=fig_height,
-            uirevision='constant',  # Preserve zoom/pan state and prevent layout recalculation
-            xaxis=dict(
-                title="",  # No axis title like notebook
-                side="bottom",
-                tickangle=90,  # Rotate labels like notebook 
-                showgrid=False,
-                tickfont=dict(size=max(6, min(12, 350/n_books))),  # Size based on number of books
-                scaleanchor="y",  # Lock aspect ratio
-                scaleratio=1,    # 1:1 aspect ratio (square)
-                automargin=False,  # Prevent automatic margin adjustment
-                fixedrange=False,  # Allow zooming
-                constrain='domain',
-                categoryorder='array',  # Preserve our label order
-                categoryarray=labels    # Use the ordered labels
-            ),
-            yaxis=dict(
-                title="",  # No axis title like notebook
-                showgrid=False,
-                autorange='reversed',  # Match notebook orientation
-                tickfont=dict(size=max(6, min(12, 350/n_books))),  # Size based on number of books
-                constrain="domain",  # Keep within plot area
-                automargin=False,  # Prevent automatic margin adjustment
-                fixedrange=False,  # Allow zooming
-                categoryorder='array',  # Preserve our label order
-                categoryarray=labels    # Use the ordered labels
-            ),
-            margin=dict(l=180, r=180, t=60, b=180),  # Fixed margins for labels
-            plot_bgcolor='white',
-            paper_bgcolor='white',
-            # Legend configuration for printers - positioned above colorbar
-            legend=dict(
-                title=dict(text="Printers", font=dict(size=14, color='black')),
-                xanchor='left',
-                x=1.01,  # Position relative to plot area
-                y=1,
-                yanchor='top',
-                bgcolor='rgba(255,255,255,0.9)',
-                bordercolor='gray',
-                borderwidth=1,
-                font=dict(size=11, color='black'),
-                itemsizing='constant',
-                itemwidth=30,
-                tracegroupgap=4
-            ) if ordered_impr is not None else None
-        )
-        
-        return fig
     
-    def _setup_layout(self):
+    def _setup_layout(self, w_combined=None):
         """Setup the dashboard layout"""
-        self.app.layout = html.Div([
-            html.H1("Book Typography Similarity Analysis Dashboard", 
-                   style={'textAlign': 'center', 'marginBottom': 30}),
-            # Control panel - Font Type selector (main control)
+        
+        # Load UMAP for store initialization (figures created on first callback for memory efficiency)
+        initial_umap = self._load_umap_positions(w_combined=w_combined / 2 if w_combined is not None else None)
+        initial_umap_list = initial_umap.tolist() if initial_umap is not None else None
+        print("✓ UMAP positions loaded, figures will be created on first render")
+        
+        # Create empty placeholder figures (actual figures created in callback to save memory)
+        initial_network_fig = go.Figure()
+        initial_heatmap_fig = go.Figure()
+        self.app.layout = html.Div([            
+            # Modern page title
             html.Div([
-                html.Label("Analysis Mode:", style={'fontSize': '16px', 'fontWeight': 'bold', 'marginRight': '15px', 'color': '#333'}),
-                dcc.RadioItems(
-                    id='font-type-dropdown',
-                    options=[
-                        {'label': ' Combined (Roman + Italic)', 'value': 'combined'},
-                        {'label': ' Roman only', 'value': 'roman'},
-                        {'label': ' Italic only', 'value': 'italic'}
-                    ],
-                    value='combined',
-                    inline=True,
-                    inputStyle={'marginRight': '8px', 'transform': 'scale(1.2)'},
-                    labelStyle={'marginRight': '25px', 'fontSize': '14px', 'cursor': 'pointer', 'padding': '8px 12px', 
-                               'backgroundColor': '#fff', 'borderRadius': '5px', 'border': '1px solid #ddd'}
-                ),
-                dcc.Store(id='layout-dropdown', data='umap'),
-            ], style={'marginBottom': 10, 'padding': '15px 20px', 'backgroundColor': '#f0f8ff', 'borderRadius': '8px', 'border': '2px solid #4a90d9'}),
+                html.H1("Theatre Chapbooks At Scale", 
+                       style={'textAlign': 'center', 'margin': '0', 'fontFamily': 'Inter, Arial, sans-serif', 
+                              'fontWeight': '700', 'fontSize': '2.2rem', 'color': '#374151',
+                              'letterSpacing': '-0.5px'}),
+                html.P("A Statistical Comparative Analysis of Typography",
+                       style={'textAlign': 'center', 'margin': '5px 0 0 0', 'fontFamily': 'Inter, Arial, sans-serif',
+                              'fontWeight': '400', 'fontSize': '1rem', 'color': '#887C57',
+                              'letterSpacing': '0.5px'}),
+            ], style={'marginBottom': '20px', 'padding': '20px 0'}),
             
-            # Store for UMAP positions cache - initialize with cached default positions if available
-            dcc.Store(id='umap-positions-store', data=self._get_initial_umap_positions()),
-            
-            # Main content with letter comparison panel
+            # Control panel - Font Type selector (centered, button style)
             html.Div([
+                # Row container
                 html.Div([
-                    # Similarity matrix - shown first
+
+                    # Label (absolutely positioned)
+                    html.Div(
+                        html.Label(
+                            "Font type",
+                            style={
+                                'fontSize': '13px',
+                                'fontWeight': '600',
+                                'color': '#887C57',
+                                'fontFamily': 'Inter, Arial, sans-serif'
+                            }
+                        ),
+                        style={'position': 'absolute', 'left': '20px', 'top': '50%', 'transform': 'translateY(-50%)'}
+                    ),
+
+                    # Button group (centered in full width)
                     html.Div([
-                           # Buttons to toggle all printer overlays and alpha overlays
-                           html.Div([
-                            html.Button("Show all printers", id='show-all-printers-btn', n_clicks=0,
-                                    style={'marginRight': '5px', 'padding': '4px 10px', 'fontSize': '11px', 
-                                        'backgroundColor': '#e8f4e8', 'border': '1px solid #4a4', 'borderRadius': '3px', 'cursor': 'pointer'}),
-                            html.Button("Hide all printers", id='hide-all-printers-btn', n_clicks=0,
-                                    style={'padding': '4px 10px', 'fontSize': '11px',
-                                        'backgroundColor': '#f4e8e8', 'border': '1px solid #a44', 'borderRadius': '3px', 'cursor': 'pointer'}),
-                           ], style={'marginBottom': '5px', 'textAlign': 'center'}),
-                        dcc.Graph(id='similarity-heatmap')
-                    ], style={'flex': '0 0 55%', 'boxSizing': 'border-box'}),
+                        html.Button("Combined", id='font-combined-btn', n_clicks=0,
+                                    style={'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                        'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                        'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+
+                        html.Button("Roman", id='font-roman-btn', n_clicks=0,
+                                    style={'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                        'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                        'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+
+                        html.Button("Italic", id='font-italic-btn', n_clicks=0,
+                                    style={'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                        'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                        'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+                    ], style={
+                        'display': 'flex',
+                        'justifyContent': 'center',
+                        'width': '100%'
+                    }),
+
+                    dcc.Store(id='font-type-store', data='combined'),
+
+                ], style={
+                    'position': 'relative',
+                    'display': 'flex',
+                    'alignItems': 'center',
+                    'justifyContent': 'center'
+                })
+            ],
+            style={
+                'marginBottom': '15px',
+                'padding': '12px 20px',
+                'backgroundColor': '#DBD1B5',
+                'borderRadius': '8px',
+                'boxShadow': '0 2px 4px rgba(0,0,0,0.15)'
+            }),
+
+            
+            # Store for UMAP positions cache - initialize with loaded positions
+            dcc.Store(id='umap-positions-store', data=initial_umap_list),
+            
+            # Store for selected books in network graph
+            dcc.Store(id='network-selected-books-store', data=[]),
+            
+            # Main content with letter comparison panel - styled container like network graph
+            html.Div([
+                # Section header
+                html.Div(
+                    html.H3(
+                        "Typographic Similarity Analysis",
+                        style={
+                            "margin": "0",
+                            "fontFamily": "Inter, Arial, sans-serif",
+                            "fontWeight": "600",
+                            "letterSpacing": "0.5px",
+                            "color": "#887C57",
+                        },
+                    ),
+                    style={
+                        "textAlign": "center",
+                        "padding": "6px 0",
+                        "backgroundColor": "#F8F5EC",
+                        "borderRadius": "6px",
+                        "marginBottom": "10px",
+                        "boxShadow": "0 1px 2px rgba(0,0,0,0.15)",
+                    },
+                ),
+                # Content row: matrix + letter comparison
+                html.Div([
+                    # Similarity matrix - left side (45%)
+                    html.Div([
+                        html.Div(
+                            "Similarity Matrix",
+                            style={
+                                'textAlign': 'center',
+                                'marginBottom': '8px',
+                                'fontFamily': 'Inter, Arial, sans-serif',
+                                'fontWeight': '600',
+                                'fontSize': '13px',
+                                'color': '#887C57'
+                            }
+                        ),
+                        # Buttons to toggle all printer overlays
+                        html.Div([
+                            html.Button("Hide Printers", id='hide-all-printers-btn', n_clicks=0,
+                                    style={'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                        'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                        'width': '110px', 'minWidth': '110px'}),
+                            html.Button("Show Printers", id='show-all-printers-btn', n_clicks=0,
+                                    style={'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                        'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                        'width': '110px', 'minWidth': '110px'}),
+                        ], style={'marginBottom': '8px', 'textAlign': 'center'}),
+                        dcc.Graph(id='similarity-heatmap', figure=initial_heatmap_fig, 
+                                  style={'width': '100%', 'aspectRatio': '1 / 1', 'borderRadius': '8px', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)s', "margin": "0 auto"},
+                                  config={'responsive': True})
+                    ], style={'flex': '1 1 45%', 'minWidth': '0', 'maxWidth': '48%', 'boxSizing': 'border-box', 'backgroundColor': '#F8F5EC', 'borderRadius': '8px', 'padding': '2px', 'overflow': 'hidden'}),
                     
-                    # Letter comparison panel - wider
+                    # Letter comparison panel - right side (45%)
                     html.Div([
-                        html.H4("Letter Comparison", style={'textAlign': 'center', 'marginBottom': '10px'}),
+                        html.Div(
+                            "Letter Comparison",
+                            style={
+                                'textAlign': 'center',
+                                'marginBottom': '8px',
+                                'fontFamily': 'Inter, Arial, sans-serif',
+                                'fontWeight': '600',
+                                'fontSize': '13px',
+                                'color': '#887C57'
+                            }
+                        ),
                         
                         # Printer filter
                         html.Div([
-                            html.Label("Filter by printer: ", style={'fontWeight': 'bold', 'marginRight': '10px', 'fontSize': '12px'}),
+                            html.Label("Filter by printer: ", style={'fontWeight': '500', 'marginRight': '10px', 'fontSize': '11px', 'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}),
                             dcc.Dropdown(
                                 id='printer-filter-dropdown',
                                 options=[],  # Will be populated
@@ -1026,14 +825,20 @@ class BookSimilarityDashboard:
                                 style={'width': '100%', 'fontSize': '11px'}
                             ),
                             html.Button("Select all from this printer", id='select-all-printer-books-btn', n_clicks=0,
-                                       style={'marginTop': '5px', 'padding': '3px 8px', 'fontSize': '10px', 'backgroundColor': '#ffe8cc', 'border': '1px solid #cc8800', 'borderRadius': '3px', 'cursor': 'pointer', 'display': 'none'}),
-                        ], style={'marginBottom': '8px', 'padding': '5px', 'backgroundColor': '#fff8e8', 'borderRadius': '5px'}),
+                                       style={'marginTop': '5px', 'padding': '6px 12px', 'fontSize': '11px', 'fontWeight': '500',
+                                              'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                              'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'none',
+                                              'boxShadow': '0 1px 3px rgba(0,0,0,0.2)'}),
+                        ], style={'marginBottom': '8px', 'padding': '8px', 'backgroundColor': '#DBD1B5', 'borderRadius': '6px'}),
                         
                         # Book selector for multi-book comparison
                         html.Div([
-                            html.Label("Select books: ", style={'fontWeight': 'bold', 'marginRight': '10px', 'fontSize': '12px'}),
+                            html.Label("Select books: ", style={'fontWeight': '500', 'marginRight': '10px', 'fontSize': '11px', 'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}),
                             html.Button("Clear", id='clear-comparison-btn', n_clicks=0, 
-                                       style={'float': 'right', 'padding': '2px 8px', 'fontSize': '10px', 'backgroundColor': '#ffcccc', 'border': '1px solid #cc0000', 'borderRadius': '3px', 'cursor': 'pointer'}),
+                                       style={'float': 'right', 'padding': '4px 10px', 'fontSize': '10px', 'fontWeight': '500',
+                                              'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                              'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                              'boxShadow': '0 1px 3px rgba(0,0,0,0.2)'}),
                             dcc.Dropdown(
                                 id='additional-books-dropdown',
                                 options=[],  # Will be populated
@@ -1044,173 +849,337 @@ class BookSimilarityDashboard:
                             ),
                             # Store to track clicked books from matrix
                             dcc.Store(id='clicked-books-store', data=[]),
-                        ], style={'marginBottom': '10px', 'padding': '5px', 'backgroundColor': '#e8f4e8', 'borderRadius': '5px'}),
+                        ], style={'marginBottom': '8px', 'padding': '8px', 'backgroundColor': '#DBD1B5', 'borderRadius': '6px'}),
                         
                         # Letter filter - now inside comparison panel
                         html.Div([
-                            html.Label("Filter: ", style={'fontWeight': 'bold', 'marginRight': '5px', 'fontSize': '12px'}),
-                            html.Button("All", id='select-all-letters', n_clicks=0, style={'marginRight': '3px', 'padding': '2px 6px', 'fontSize': '11px'}),
-                            html.Button("None", id='select-no-letters', n_clicks=0, style={'marginRight': '8px', 'padding': '2px 6px', 'fontSize': '11px'}),
-                            html.Button("a-z", id='select-lowercase', n_clicks=0, style={'marginRight': '3px', 'padding': '2px 6px', 'fontSize': '11px'}),
-                            html.Button("A-Z", id='select-uppercase', n_clicks=0, style={'marginRight': '8px', 'padding': '2px 6px', 'fontSize': '11px'}),
+                            html.Label("Filter: ", style={'fontWeight': '500', 'marginRight': '5px', 'fontSize': '11px', 'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}),
+                            html.Button("All", id='select-all-letters', n_clicks=0, 
+                                       style={'marginRight': '3px', 'padding': '4px 8px', 'fontSize': '10px', 'fontWeight': '500',
+                                              'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                              'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
+                            html.Button("None", id='select-no-letters', n_clicks=0, 
+                                       style={'marginRight': '8px', 'padding': '4px 8px', 'fontSize': '10px', 'fontWeight': '500',
+                                              'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                              'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
+                            html.Button("a-z", id='select-lowercase', n_clicks=0, 
+                                       style={'marginRight': '3px', 'padding': '4px 8px', 'fontSize': '10px', 'fontWeight': '500',
+                                              'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                              'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
+                            html.Button("A-Z", id='select-uppercase', n_clicks=0, 
+                                       style={'marginRight': '8px', 'padding': '4px 8px', 'fontSize': '10px', 'fontWeight': '500',
+                                              'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                              'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
                             dcc.Checklist(
                                 id='letter-filter',
                                 options=[],
                                 value=[],
                                 inline=True,
-                                style={'display': 'inline-block', 'fontSize': '12px'},
+                                style={'display': 'inline-block', 'fontSize': '11px'},
                                 inputStyle={'marginRight': '2px', 'marginLeft': '6px'}
                             )
-                        ], style={'marginBottom': '10px', 'padding': '5px 10px', 'backgroundColor': '#f0f8ff', 'borderRadius': '5px'}),
+                        ], style={'marginBottom': '8px', 'padding': '8px', 'backgroundColor': '#DBD1B5', 'borderRadius': '6px'}),
                         
                         html.Div(id='letter-comparison-panel', 
                                 style={
-                                    'border': '2px solid #ddd', 
-                                    'borderRadius': '5px',
+                                    'border': '1px solid #d1c7ad', 
+                                    'borderRadius': '6px',
                                     'padding': '15px',
-                                    'backgroundColor': '#fafafa',
+                                    'backgroundColor': '#F8F5EC',
                                     'minHeight': '500px',
                                     'maxHeight': '800px',
                                     'overflowY': 'auto'
                                 },
                                 children=[
                                     html.P("Click on a cell in the similarity matrix or a node in the network graph", 
-                                          style={'textAlign': 'center', 'color': 'gray', 'marginTop': '200px', 'fontSize': '14px'})
+                                          style={'textAlign': 'center', 'color': '#6b7280', 'marginTop': '200px', 'fontSize': '13px', 'fontFamily': 'Inter, Arial, sans-serif'})
                                 ])
-                    ], style={'flex': '0 0 43%', 'boxSizing': 'border-box'})
-                ], style={'marginBottom': '30px', 'display': 'flex', 'gap': '2%', 'alignItems': 'flex-start', 'flexWrap': 'wrap'}),
+                    ], style={'flex': '1 1 45%', 'minWidth': '0', 'maxWidth': '48%', 'boxSizing': 'border-box', 'backgroundColor': '#F8F5EC', 'borderRadius': '8px', 'padding': '10px', 'overflow': 'hidden'})
+                ], style={'display': 'flex', 'gap': '2%', 'alignItems': 'flex-start', 'justifyContent': 'space-between'}),
+            ], style={
+                "width": "100%",
+                "backgroundColor": "#DBD1B5",
+                "borderRadius": "8px",
+                "boxShadow": "0 2px 4px rgba(0,0,0,0.15)",
+                "padding": "10px",
+                "marginBottom": "20px"
+            }),
                 
                 # Network graph section with controls
+            html.Div([
+                html.Div(
+                    html.H3(
+                        "Graph of Typographic Similarity",
+                        style={
+                            "margin": "0",
+                            "fontFamily": "Inter, Arial, sans-serif",
+                            "fontWeight": "600",
+                            "letterSpacing": "0.5px",
+                            "color": "#887C57",
+                        },
+                    ),
+                    style={
+                        "textAlign": "center",
+                        "padding": "6px 0",
+                        "backgroundColor": "#F8F5EC",
+                        "borderRadius": "6px",
+                        "marginBottom": "10px",
+                        "boxShadow": "0 1px 2px rgba(0,0,0,0.15)",
+                    },
+                ),
+
+                # Network graph controls row - 3 columns with fixed 30% width each
                 html.Div([
-                    html.H3("Network Graph", style={'textAlign': 'center', 'marginBottom': '10px'}),
-                    
-                    # Network graph controls row
+                    # Column 1: Hide/Show buttons (30% width, centered content)
                     html.Div([
-                        # Show/hide labels buttons
                         html.Div([
-                            html.Button("Show labels", id='show-all-labels-btn', n_clicks=0,
-                                       style={'marginRight': '3px', 'padding': '3px 8px', 'fontSize': '10px', 
-                                              'backgroundColor': '#e8f4e8', 'border': '1px solid #4a4', 'borderRadius': '3px', 'cursor': 'pointer'}),
-                            html.Button("Hide labels", id='hide-all-labels-btn', n_clicks=0,
-                                       style={'marginRight': '10px', 'padding': '3px 8px', 'fontSize': '10px',
-                                              'backgroundColor': '#f4e8e8', 'border': '1px solid #a44', 'borderRadius': '3px', 'cursor': 'pointer'}),
-                            html.Button("Show markers", id='show-all-markers-btn', n_clicks=0,
-                                       style={'marginRight': '3px', 'padding': '3px 8px', 'fontSize': '10px', 
-                                              'backgroundColor': '#e8e8f4', 'border': '1px solid #44a', 'borderRadius': '3px', 'cursor': 'pointer'}),
-                            html.Button("Hide markers", id='hide-all-markers-btn', n_clicks=0,
-                                       style={'marginRight': '15px', 'padding': '3px 8px', 'fontSize': '10px',
-                                              'backgroundColor': '#f4e8f4', 'border': '1px solid #a4a', 'borderRadius': '3px', 'cursor': 'pointer'}),
-                            html.Button("Show all printers", id='show-all-network-printers-btn', n_clicks=0,
-                                       style={'marginRight': '3px', 'padding': '3px 8px', 'fontSize': '10px',
-                                              'backgroundColor': '#e8f4e8', 'border': '1px solid #4a4', 'borderRadius': '3px', 'cursor': 'pointer'}),
-                            html.Button("Hide all printers", id='hide-all-network-printers-btn', n_clicks=0,
-                                       style={'padding': '3px 8px', 'fontSize': '10px',
-                                              'backgroundColor': '#f4e8e8', 'border': '1px solid #a44', 'borderRadius': '3px', 'cursor': 'pointer'}),
-                        ], style={'display': 'inline-block', 'verticalAlign': 'middle'}),
+                            html.Button("Hide Labels", id='hide-all-labels-btn', n_clicks=0,
+                                           style={'marginRight': '5px', 'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Button("Show Labels", id='show-all-labels-btn', n_clicks=0,
+                                           style={'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Br(),
+                                html.Button("Hide Markers", id='hide-all-markers-btn', n_clicks=0,
+                                           style={'marginRight': '5px', 'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Button("Show Markers", id='show-all-markers-btn', n_clicks=0,
+                                           style={'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Br(),
+                                html.Button("Hide Printers", id='hide-all-network-printers-btn', n_clicks=0,
+                                           style={'marginRight': '5px', 'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Button("Show Printers", id='show-all-network-printers-btn', n_clicks=0,
+                                           style={'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Br(),
+                                html.Button("Hide Selected", id='hide-selected-books-btn', n_clicks=0,
+                                           style={'marginRight': '5px', 'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Button("Show Selected", id='show-selected-books-btn', n_clicks=0,
+                                           style={'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                            ], style={'display': 'inline-block', 'textAlign': 'center'})
+                        ], style={'width': '30%', 'flexShrink': '0', 'flexGrow': '0', 'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center'}),
                         
-                        # Edge opacity slider - adjusted range for better visibility control
+                        # Column 2: Sliders stacked vertically (30% width, centered content)
                         html.Div([
-                            html.Label("Edge Opacity:", style={'fontSize': '11px', 'fontWeight': 'bold', 'marginRight': '5px'}),
-                            dcc.Slider(
-                                id='edge-opacity-slider',
-                                min=0.0,
-                                max=2.0,
-                                step=0.1,
-                                value=1.0,
-                                marks={0: '0', 0.5: '0.5', 1.0: '1.0', 1.5: '1.5', 2.0: '2.0'},
-                                tooltip={"placement": "bottom", "always_visible": False}
-                            )
-                        ], style={'width': '20%', 'display': 'inline-block', 'verticalAlign': 'middle', 'marginLeft': '10px'}),
-                        
-                        # Node and label size sliders
+                            html.Div([
+                                html.Div([
+                                    html.Label("Edge Opacity:", style={
+                                        'fontSize': '11px',
+                                        'fontWeight': '500',
+                                        'color': 'dimgray',
+                                        'fontFamily': 'Inter, Arial, sans-serif',
+                                        'marginBottom': '2px'   # 👈 tighten label spacing
+                                    }),
+                                    dcc.Slider(
+                                        id='edge-opacity-slider',
+                                        min=0,
+                                        max=2,
+                                        step=0.1,
+                                        value=1,
+                                        marks={
+                                            0: {'label': '0', 'style': {'fontSize': '10px'}},
+                                            1: {'label': '1', 'style': {'fontSize': '10px'}},
+                                            2: {'label': '2', 'style': {'fontSize': '10px'}}
+                                        },
+                                        tooltip={"placement": "bottom", "always_visible": False},
+                                        className="compact-slider"
+                                    )
+                                ], style={'marginBottom': '-10px'}),   # 👈 reduce gap between blocks
+
+                                html.Div([
+                                    html.Label("Node Size:", style={
+                                        'fontSize': '11px',
+                                        'fontWeight': '500',
+                                        'color': 'dimgray',
+                                        'fontFamily': 'Inter, Arial, sans-serif',
+                                        'marginBottom': '2px'
+                                    }),
+                                    dcc.Slider(
+                                        id='node-size-slider',
+                                        min=6,
+                                        max=24,
+                                        step=1,
+                                        value=12,
+                                        marks={
+                                            6: {'label': '6', 'style': {'fontSize': '10px'}},
+                                            15: {'label': '15', 'style': {'fontSize': '10px'}},
+                                            24: {'label': '24', 'style': {'fontSize': '10px'}}
+                                        },
+                                        tooltip={"placement": "bottom", "always_visible": False},
+                                        className="compact-slider"
+                                    ),
+                                ], style={'marginBottom': '-10px'}),
+
+                                html.Div([
+                                    html.Label("Label Size:", style={
+                                        'fontSize': '11px',
+                                        'fontWeight': '500',
+                                        'color': 'dimgray',
+                                        'fontFamily': 'Inter, Arial, sans-serif',
+                                        'marginBottom': '2px'
+                                    }),
+                                    dcc.Slider(
+                                        id='label-size-slider',
+                                        min=6,
+                                        max=24,
+                                        step=1,
+                                        value=8,
+                                        marks={
+                                            6: {'label': '6', 'style': {'fontSize': '10px'}},
+                                            15: {'label': '15', 'style': {'fontSize': '10px'}},
+                                            24: {'label': '24', 'style': {'fontSize': '10px'}}
+                                        },
+                                        tooltip={"placement": "bottom", "always_visible": False},
+                                        className="compact-slider"
+                                    ),
+                                ]),
+                            ], style={'width': '85%'})
+                        ], style={
+                            'width': '30%',
+                            'flexShrink': '0',
+                            'flexGrow': '0',
+                            'display': 'flex',
+                            'flexDirection': 'column',
+                            'justifyContent': 'center'
+                        }),
+
+                        # Column 3: UMAP Parameters box (30% width)
                         html.Div([
-                            html.Label("Node Size:", style={'fontSize': '11px', 'fontWeight': 'bold', 'marginRight': '5px'}),
-                            dcc.Slider(
-                                id='node-size-slider',
-                                min=6,
-                                max=36,
-                                step=1,
-                                value=12,
-                                marks={i: str(i) for i in range(6, 37, 6)},
-                                tooltip={"placement": "bottom", "always_visible": False},
-                            ),
-                            html.Label("Label Size:", style={'fontSize': '11px', 'fontWeight': 'bold', 'marginLeft': '10px', 'marginRight': '5px'}),
-                            dcc.Slider(
-                                id='label-size-slider',
-                                min=6,
-                                max=24,
-                                step=1,
-                                value=8,
-                                marks={i: str(i) for i in range(6, 25, 6)},
-                                tooltip={"placement": "bottom", "always_visible": False},
-                            ),
-                        ], style={'width': '35%', 'display': 'inline-block', 'verticalAlign': 'middle', 'marginLeft': '10px'}),
-                        
-                        # UMAP controls (collapsible)
-                        html.Div([
-                            html.Details([
-                                html.Summary("UMAP Parameters", style={'cursor': 'pointer', 'fontWeight': 'bold', 'fontSize': '11px'}),
+                            html.Div([
+                                html.Div("UMAP Parameters", style={'fontWeight': '600', 'fontSize': '11px', 'color': "#887C57", 'marginBottom': '8px', 'textAlign': 'center', 'fontFamily': 'Inter, Arial, sans-serif'}),
                                 html.Div([
                                     html.Div([
-                                        html.Label("n_neighbors:", style={'fontSize': '10px'}),
+                                        html.Label("Number of Neighbors:", style={'fontSize': '10px', 'color': 'dimgray', 'fontFamily': 'Inter, Arial, sans-serif'}),
                                         dcc.Slider(
                                             id='umap-n-neighbors',
                                             min=5,
                                             max=100,
                                             step=5,
                                             value=50,
-                                            marks={5: '5', 50: '50', 100: '100'},
+                                            marks={5: {'label': '5', 'style': {'fontSize': '8px'}}, 50: {'label': '50', 'style': {'fontSize': '8px'}}, 100: {'label': '100', 'style': {'fontSize': '8px'}}},
                                             tooltip={"placement": "bottom", "always_visible": False}
                                         )
-                                    ], style={'width': '35%', 'display': 'inline-block'}),
+                                    ], style={'width': '45%', 'display': 'inline-block', 'marginRight': '5%'}),
                                     
                                     html.Div([
-                                        html.Label("min_dist:", style={'fontSize': '10px'}),
+                                        html.Label("Minimum Distance:", style={'fontSize': '10px', 'color': 'dimgray','fontFamily': 'Inter, Arial, sans-serif'}),
                                         dcc.Slider(
                                             id='umap-min-dist',
                                             min=0.0,
                                             max=1.0,
                                             step=0.05,
                                             value=0.5,
-                                            marks={0: '0', 0.5: '0.5', 1: '1'},
+                                            marks={0: {'label': '0', 'style': {'fontSize': '8px'}}, 0.5: {'label': '0.5', 'style': {'fontSize': '8px'}}, 1: {'label': '1', 'style': {'fontSize': '8px'}}},
                                             tooltip={"placement": "bottom", "always_visible": False}
                                         )
-                                    ], style={'width': '35%', 'display': 'inline-block', 'marginLeft': '5%'}),
+                                    ], style={'width': '45%', 'display': 'inline-block'}),
                                     
                                     html.Div([
-                                        html.Button("Recalculate", id='recalculate-umap-btn', n_clicks=0,
-                                                   style={'padding': '5px 10px', 'fontSize': '10px', 'backgroundColor': '#4a90d9', 
-                                                          'color': 'white', 'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'})
-                                    ], style={'width': '15%', 'display': 'inline-block', 'marginLeft': '5%', 'verticalAlign': 'bottom'})
+                                        html.Button(
+                                                "Recalculate",
+                                                id="recalculate-umap-btn",
+                                                n_clicks=0,
+                                                style={
+                                                    "padding": "6px 14px",
+                                                    "fontSize": "12px",
+                                                    "fontWeight": "500",
+                                                    "fontFamily": "Inter, Arial, sans-serif",
+                                                    "backgroundColor": "#2f4a84",
+                                                    "color": "white",
+                                                    "border": "none",
+                                                    "borderRadius": "6px",
+                                                    "cursor": "pointer",
+                                                    "display": "inline-flex",
+                                                    "alignItems": "center",
+                                                    "justifyContent": "center",
+                                                    "boxShadow": "0 1px 3px rgba(0,0,0,0.2)",
+                                                    "transition": "background-color 0.15s ease, transform 0.05s ease",
+                                                    "lineHeight": "1",
+                                                },
+                                            )
+                                    ], style={'width': '100%', 'textAlign': 'center', 'marginTop': '8px'})
                                 ], style={'padding': '5px 0'})
-                            ], open=False)
-                        ], style={'display': 'inline-block', 'width': '45%', 'marginLeft': '10px', 'verticalAlign': 'middle',
-                                  'backgroundColor': '#f0f4f8', 'borderRadius': '5px', 'padding': '3px 10px'}),
-                    ], style={'marginBottom': '5px', 'padding': '5px 10px', 'backgroundColor': '#f5f5f5', 'borderRadius': '5px', 'textAlign': 'center'}),
-                    
-                    dcc.Graph(id='network-graph', style={'height': '800px'})
-                ], style={'width': '100%'})
-            ]),
-            
-            # Statistics panel
+                            ], style={'backgroundColor': "#F8F5EC", 'borderRadius': '8px', 'padding': '8px 10px', 'width': '100%'})
+                        ], style={'width': '30%', 'flexShrink': '0', 'flexGrow': '0', 'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center'}),
+                ], style={'marginBottom': '5px', 'padding': '10px', 'backgroundColor': "#DBD1B5", 'borderRadius': '8px', 'display': 'flex', 'flexWrap': 'nowrap', 'alignItems': 'stretch', 'justifyContent': 'space-between'}),
+                
+                dcc.Graph(id='network-graph', figure=initial_network_fig, style={'height': '800px', 'marginTop': '8px', 'borderRadius': '8px', 'overflow': 'hidden'})
+            ], style={
+                "width": "100%",
+                "backgroundColor": "#DBD1B5",
+                "borderRadius": "8px",
+                "boxShadow": "0 2px 4px rgba(0,0,0,0.15)",
+                "padding": "5px",
+            }),
+                        
+            # Export section - matching theme
             html.Div([
-                html.H3("Analysis Statistics"),
-                html.Div(id='stats-panel')
-            ], style={'marginTop': 30, 'padding': 20, 'backgroundColor': '#f0f0f0'}),
-            
-            # Export section
-            html.Div([
-                html.H3("Export Options"),
+                html.Div(
+                    html.H3(
+                        "Export",
+                        style={
+                            "margin": "0",
+                            "fontFamily": "Inter, Arial, sans-serif",
+                            "fontWeight": "600",
+                            "letterSpacing": "0.5px",
+                            "color": "#887C57",
+                        },
+                    ),
+                    style={
+                        "textAlign": "center",
+                        "padding": "6px 0",
+                        "backgroundColor": "#F8F5EC",
+                        "borderRadius": "6px",
+                        "marginBottom": "10px",
+                        "boxShadow": "0 1px 2px rgba(0,0,0,0.15)",
+                    },
+                ),
                 html.Div([
-                    html.Button("Export Network Data (JSON)", id="export-network-btn", n_clicks=0, 
-                               style={'marginRight': '10px', 'padding': '8px 15px'}),
-                    html.Button("Export Similarity Matrix (CSV)", id="export-matrix-btn", n_clicks=0,
-                               style={'marginRight': '10px', 'padding': '8px 15px'}),
-                    html.Button("📄 Download HTML", id="export-html-btn", n_clicks=0,
-                               style={'marginRight': '10px', 'padding': '8px 15px', 'backgroundColor': '#4CAF50', 'color': 'white', 'border': 'none', 'borderRadius': '4px'}),
-                ], style={'marginBottom': '10px'}),
-                html.Div(id="export-status")
-            ], style={'marginTop': 30, 'padding': 20, 'backgroundColor': '#f0f0f0'}),
+                    html.Button("Download HTML", id="export-html-btn", n_clicks=0,
+                               style={'padding': '10px 20px', 'backgroundColor': '#2f4a84', 'color': 'white', 
+                                      'border': 'none', 'borderRadius': '6px', 'fontSize': '13px', 
+                                      'cursor': 'pointer', 'fontWeight': '500', 'fontFamily': 'Inter, Arial, sans-serif',
+                                      'boxShadow': '0 1px 3px rgba(0,0,0,0.2)'}),
+                ], style={'textAlign': 'center'}),
+                html.Div(id="export-status", style={'textAlign': 'center', 'marginTop': '10px', 'fontFamily': 'Inter, Arial, sans-serif', 'color': '#5a5040'})
+            ], style={'marginTop': '20px', 'padding': '10px', 'backgroundColor': '#DBD1B5', 'borderRadius': '8px',
+                      'boxShadow': '0 2px 4px rgba(0,0,0,0.15)'}),
             
             # Download component for HTML export
             dcc.Download(id="download-html")
@@ -1219,12 +1188,115 @@ class BookSimilarityDashboard:
     def _setup_callbacks(self):
         """Setup dashboard callbacks"""
         
+        # Font type button callback - updates store and button styles
+        @self.app.callback(
+            [Output('font-type-store', 'data'),
+             Output('font-combined-btn', 'style'),
+             Output('font-roman-btn', 'style'),
+             Output('font-italic-btn', 'style')],
+            [Input('font-combined-btn', 'n_clicks'),
+             Input('font-roman-btn', 'n_clicks'),
+             Input('font-italic-btn', 'n_clicks')],
+            [State('font-type-store', 'data')],
+            prevent_initial_call=True
+        )
+        def update_font_type(combined_clicks, roman_clicks, italic_clicks, current_font_type):
+            # Button styles
+            active_style = {'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                           'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                           'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                           'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                           'width': '100px', 'minWidth': '100px'}
+            inactive_style = {'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                             'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                             'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                             'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                             'width': '100px', 'minWidth': '100px'}
+            inactive_style_last = {**inactive_style, 'marginRight': '0'}  # Last button no margin
+            active_style_last = {**active_style, 'marginRight': '0'}
+            
+            ctx = dash.callback_context
+            if not ctx.triggered:
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            
+            trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+            
+            if trigger_id == 'font-combined-btn':
+                return 'combined', active_style, inactive_style, inactive_style_last
+            elif trigger_id == 'font-roman-btn':
+                return 'roman', inactive_style, active_style, inactive_style_last
+            elif trigger_id == 'font-italic-btn':
+                return 'italic', inactive_style, inactive_style, active_style_last
+            
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        
+        # Font type update callback - updates network graph and heatmap
+        @self.app.callback(
+            [Output('network-graph', 'figure'),
+             Output('similarity-heatmap', 'figure'),
+             Output('umap-positions-store', 'data')],
+            [Input('font-type-store', 'data')],
+            [State('umap-positions-store', 'data'),
+             State('network-graph', 'figure'),
+             State('similarity-heatmap', 'figure'),
+             State('edge-opacity-slider', 'value')],
+            prevent_initial_call=False
+        )
+        def update_visualizations(font_type, umap_pos_array, current_network_fig, current_heatmap_fig, edge_opacity):
+            # Handle None case for UMAP positions (load default if store not initialized)
+            store_update = dash.no_update
+            if umap_pos_array is None:
+                umap_pos_array = self._load_umap_positions()
+                if umap_pos_array is not None:
+                    store_update = umap_pos_array.tolist()  # Update store with list for JSON
+                else:
+                    return dash.no_update, dash.no_update, dash.no_update
+            
+            # Convert list to numpy array ONCE at start (from dcc.Store JSON)
+            # Use asarray (not array) to avoid copying if already an array
+            umap_array = np.asarray(umap_pos_array, dtype=np.float32)
+            
+            # Select appropriate n1hat matrix
+            if font_type == 'roman':
+                n1hat_matrix = self.n1hat_rm
+            elif font_type == 'italic':
+                n1hat_matrix = self.n1hat_it
+            else:
+                n1hat_matrix = (self.n1hat_rm + self.n1hat_it) / 2
+            
+            # Check if figures are empty (initial state) or need full redraw
+            if not current_network_fig.get('data'):
+                # Full redraw - pass array directly
+                network_fig = self._create_network_graph(umap_array, edge_opacity or 1.0, font_type=font_type)
+            else:
+                # Minimal update: patch network edges - pass array directly
+                network_fig = self._update_network_edges(current_network_fig, edge_opacity or 1.0, umap_array, font_type)
+            
+            if not current_heatmap_fig.get('data'):
+                # Full redraw
+                heatmap_fig = self._create_heatmap()
+            else:
+                # Minimal update: patch heatmap z/title and network edges
+                heatmap_fig = dash.Patch()
+                heatmap_fig['data'][0]['z'] = n1hat_matrix
+                
+                # Update customdata for marker traces
+                types_diag = np.diagonal(n1hat_matrix)
+                for i in range(1, len(current_heatmap_fig['data'])):
+                    trace = current_heatmap_fig['data'][i]
+                    impr = trace['name']
+                    mask = self.impr_names == impr  # boolean mask
+                    if np.any(mask):
+                        heatmap_fig['data'][i]['customdata'] = types_diag[mask][:, None]
+                        
+            return network_fig, heatmap_fig, store_update
+        
         # Initialize letter filter and printer dropdown on load
         @self.app.callback(
             [Output('letter-filter', 'options'),
              Output('letter-filter', 'value'),
              Output('printer-filter-dropdown', 'options')],
-            [Input('font-type-dropdown', 'value')],  # Just trigger on load
+            [Input('font-type-store', 'data')],  # Just trigger on load
             prevent_initial_call=False
         )
         def init_filters(_):
@@ -1324,6 +1396,70 @@ class BookSimilarityDashboard:
             
             return dash.no_update, dash.no_update
         
+        # Add row/column overlays for selected books
+        @self.app.callback(
+            Output('similarity-heatmap', 'figure', allow_duplicate=True),
+            [Input('additional-books-dropdown', 'value')],
+            [State('similarity-heatmap', 'figure')],
+            prevent_initial_call=True
+        )
+        def update_matrix_overlays(selected_books, current_fig):
+            if current_fig is None:
+                return dash.no_update
+            
+            patched_fig = dash.Patch()
+            
+            # Remove existing overlay traces (traces with name starting with 'overlay_')
+            data_to_keep = []
+            for i, trace in enumerate(current_fig.get('data', [])):
+                if not trace.get('name', '').startswith('overlay_'):
+                    data_to_keep.append(trace)
+            
+            # Set the data to only non-overlay traces
+            patched_fig['data'] = data_to_keep
+            
+            # Add new overlays for selected books
+            if selected_books:
+                n_books = len(self.books)
+                book_list = list(self.books)
+                
+                for book in selected_books:
+                    if book in book_list:
+                        book_idx = book_list.index(book)
+                        
+                        # Get book-specific color with 0.35 alpha
+                        book_color = self._get_book_color(book)
+                        # Convert hex to rgba with 0.35 alpha
+                        r = int(book_color[1:3], 16)
+                        g = int(book_color[3:5], 16)
+                        b = int(book_color[5:7], 16)
+                        overlay_color = f'rgba({r}, {g}, {b}, 0.35)'
+                        
+                        # Horizontal line (row)
+                        patched_fig['data'].append({
+                            'type': 'scatter',
+                            'x': [book_list[0], book_list[-1]],
+                            'y': [book, book],
+                            'mode': 'lines',
+                            'line': {'color': overlay_color, 'width': 3},
+                            'showlegend': False,
+                            'hoverinfo': 'skip',
+                            'name': f'overlay_row_{book}'
+                        })
+                        
+                        # Vertical line (column)
+                        patched_fig['data'].append({
+                            'type': 'scatter',
+                            'x': [book, book],
+                            'y': [book_list[0], book_list[-1]],
+                            'mode': 'lines',
+                            'line': {'color': overlay_color, 'width': 3},
+                            'showlegend': False,
+                            'hoverinfo': 'skip',
+                            'name': f'overlay_col_{book}'
+                        })
+            
+            return patched_fig
             
         # Quick select buttons for letter filter
         @self.app.callback(
@@ -1350,71 +1486,111 @@ class BookSimilarityDashboard:
                 return [l for l in self._all_letters if l.isupper()]
             return dash.no_update
         
+        # Define button styles for active/inactive states
+        active_btn_style = {
+            'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+            'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+            'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+            'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+            'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+            'width': '120px', 'minWidth': '120px'
+        }
+        inactive_btn_style = {
+            'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+            'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+            'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+            'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+            'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+            'width': '120px', 'minWidth': '120px'
+        }
+        
         # Show/Hide all labels on network graph
         @self.app.callback(
-            Output('network-graph', 'figure', allow_duplicate=True),
+            [Output('network-graph', 'figure', allow_duplicate=True),
+             Output('show-all-labels-btn', 'style'),
+             Output('hide-all-labels-btn', 'style')],
             [Input('show-all-labels-btn', 'n_clicks'),
              Input('hide-all-labels-btn', 'n_clicks')],
             [State('network-graph', 'figure')],
             prevent_initial_call=True
         )
         def toggle_network_labels(show_clicks, hide_clicks, current_fig):
-            if current_fig is None:
-                return dash.no_update
-            
             ctx = dash.callback_context
             if not ctx.triggered:
-                return dash.no_update
+                return dash.no_update, dash.no_update, dash.no_update
             
             trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
             show_labels = trigger_id == 'show-all-labels-btn'
             
+            # Set button styles based on which is active
+            show_style = {**active_btn_style} if show_labels else {**inactive_btn_style}
+            hide_style = {**active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'} if not show_labels else {**inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            show_style['marginBottom'] = '8px'
+            
+            if not current_fig.get('data'):
+                return dash.no_update, show_style, hide_style
+            
             # Use Patch for efficient update
             patched_fig = dash.Patch()
             
-            # Update text visibility for all node traces (skip first trace which is edges)
-            for i in range(1, len(current_fig['data'])):
-                current_mode = current_fig['data'][i].get('mode', 'markers')
+            # Update text visibility for all node traces (skip bin_ traces which are edges)
+            for i, trace in enumerate(current_fig['data']):
+                name = trace.get('name', '')
+                # Skip edge traces (named bin_0, bin_1, etc.)
+                if name.startswith('bin_') or name.startswith('selected_'):
+                    continue
+                current_mode = trace.get('mode', 'markers')
                 has_markers = 'markers' in current_mode
                 if show_labels:
                     patched_fig['data'][i]['mode'] = 'markers+text' if has_markers else 'text'
                 else:
                     patched_fig['data'][i]['mode'] = 'markers' if has_markers else 'none'
             
-            return patched_fig
+            return patched_fig, show_style, hide_style
         
         # Show/Hide all markers on network graph
         @self.app.callback(
-            Output('network-graph', 'figure', allow_duplicate=True),
+            [Output('network-graph', 'figure', allow_duplicate=True),
+             Output('show-all-markers-btn', 'style'),
+             Output('hide-all-markers-btn', 'style')],
             [Input('show-all-markers-btn', 'n_clicks'),
              Input('hide-all-markers-btn', 'n_clicks')],
             [State('network-graph', 'figure')],
             prevent_initial_call=True
         )
         def toggle_network_markers(show_clicks, hide_clicks, current_fig):
-            if current_fig is None:
-                return dash.no_update
-            
             ctx = dash.callback_context
             if not ctx.triggered:
-                return dash.no_update
+                return dash.no_update, dash.no_update, dash.no_update
             
             trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
             show_markers = trigger_id == 'show-all-markers-btn'
             
+            # Set button styles based on which is active
+            show_style = {**active_btn_style} if show_markers else {**inactive_btn_style}
+            hide_style = {**active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'} if not show_markers else {**inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            show_style['marginBottom'] = '8px'
+            
+            if not current_fig.get('data'):
+                return dash.no_update, show_style, hide_style
+            
             # Use Patch for efficient update
             patched_fig = dash.Patch()
             
-            # Update marker visibility for all node traces (skip first trace which is edges)
-            for i in range(1, len(current_fig['data'])):
-                current_mode = current_fig['data'][i].get('mode', 'markers')
+            # Update marker visibility for all node traces (skip bin_ traces which are edges)
+            for i, trace in enumerate(current_fig['data']):
+                # Skip edge traces (named bin_0, bin_1, etc.)
+                name = trace.get('name', '')
+                if name.startswith('bin_') or name.startswith('selected_'):
+                    continue
+                current_mode = trace.get('mode', 'markers')
                 has_text = 'text' in current_mode
                 if show_markers:
                     patched_fig['data'][i]['mode'] = 'markers+text' if has_text else 'markers'
                 else:
                     patched_fig['data'][i]['mode'] = 'text' if has_text else 'none'
             
-            return patched_fig
+            return patched_fig, show_style, hide_style
         
         # Click on network graph node to add book to comparison
         @self.app.callback(
@@ -1447,70 +1623,7 @@ class BookSimilarityDashboard:
                 current_books.append(book_name)
             
             return current_books, current_books
-        
-        # Callback to recalculate UMAP positions
-        @self.app.callback(
-            Output('umap-positions-store', 'data'),
-            [Input('recalculate-umap-btn', 'n_clicks')],
-            [State('umap-n-neighbors', 'value'),
-             State('umap-min-dist', 'value')],
-            prevent_initial_call=True
-        )
-        def recalculate_umap(n_clicks, n_neighbors, min_dist):
-            if n_clicks is None or n_clicks == 0:
-                return dash.no_update
-            
-            # Check cache first for these parameters
-            cache_key = f'umap_positions_{n_neighbors}_{min_dist}'
-            if cache_key in self._figures_cache:
-                print(f"Using cached UMAP positions for n_neighbors={n_neighbors}, min_dist={min_dist}")
-                cached = self._figures_cache[cache_key]
-                return cached.tolist() if hasattr(cached, 'tolist') else cached
-            
-            # Compute new UMAP positions
-            print(f"Computing UMAP positions for n_neighbors={n_neighbors}, min_dist={min_dist}...")
-            distance_matrix = 1 - (self.w_rm + self.w_it) / 2  # Combined distance
-            np.fill_diagonal(distance_matrix, 0)
-            positions = self._compute_umap_positions(distance_matrix, n_neighbors, min_dist)
-            
-            if positions is not None:
-                # Cache for future use (manage UMAP cache size)
-                # Insert new entry
-                self._figures_cache[cache_key] = positions
-
-                # Trim only UMAP-related entries first to respect MAX_UMAP_CACHE_SIZE
-                umap_keys = [k for k in self._figures_cache.keys() if k.startswith('umap_positions_')]
-                # Keep default key if present
-                default_key = 'umap_positions_50_0.5'
-                # If too many UMAP entries, remove the oldest non-default ones
-                if len(umap_keys) > self.MAX_UMAP_CACHE_SIZE:
-                    removable = [k for k in umap_keys if k != default_key]
-                    # Remove oldest until under limit
-                    while len([k for k in self._figures_cache.keys() if k.startswith('umap_positions_')]) > self.MAX_UMAP_CACHE_SIZE and removable:
-                        key_to_remove = removable.pop(0)
-                        if key_to_remove in self._figures_cache:
-                            del self._figures_cache[key_to_remove]
-
-                # Global figure cache trim: keep total entries under MAX_FIGURE_CACHE_SIZE
-                while len(self._figures_cache) > self.MAX_FIGURE_CACHE_SIZE:
-                    # Remove oldest non-default entry
-                    for k in list(self._figures_cache.keys()):
-                        if k != default_key:
-                            del self._figures_cache[k]
-                            break
-
-                return positions.tolist()  # Convert to list for JSON serialization
-            return None
-        
-        # Reset edge opacity slider to 1.0 when font type changes
-        @self.app.callback(
-            Output('edge-opacity-slider', 'value'),
-            [Input('font-type-dropdown', 'value')],
-            prevent_initial_call=False
-        )
-        def reset_opacity_on_font_change(font_type):
-            return 1.0
-        
+                
         # Separate callback for edge opacity - uses Patch for instant updates
         @self.app.callback(
             Output('network-graph', 'figure', allow_duplicate=True),
@@ -1519,17 +1632,17 @@ class BookSimilarityDashboard:
             prevent_initial_call=True
         )
         def update_edge_opacity_only(edge_opacity, current_fig):
-            if current_fig is None:
+            if not current_fig.get('data'):
                 return dash.no_update
             if edge_opacity is None:
                 return dash.no_update
 
-            self.edge_opacity = edge_opacity  # Store current opacity
             patched = dash.Patch()
             
             # Update bin traces by iterating through data and checking names
             for i, trace in enumerate(current_fig['data']):
-                if trace['name'].startswith('bin_'):
+                name = trace.get('name', '')
+                if name.startswith('bin_') or name.startswith('selected_edge_'):
                     customdata = trace.get('customdata', [])
                     if customdata and len(customdata) > 0:
                         w = customdata[0]
@@ -1548,7 +1661,7 @@ class BookSimilarityDashboard:
         )
         def update_node_label_size(node_size, label_size, current_fig):
             """Update only node and label sizes using Patch, preserving zoom and layout."""
-            if current_fig is None:
+            if not current_fig.get('data'):
                 return dash.no_update
             patched_fig = dash.Patch()
             # Node traces start at index 1 (0 is edges)
@@ -1558,190 +1671,303 @@ class BookSimilarityDashboard:
                 if 'marker' in trace:
                     # Unknown/missing printers are 5/6 size
                     if 'rgba(128, 128, 128' in str(trace.get('marker', {}).get('color', '')):
-                        patched_fig['data'][i]['marker']['size'] = int(node_size * 5 / 6)
+                        patched_fig['data'][i]['marker']['size'] = int(node_size * 1 / 2)
                     else:
                         patched_fig['data'][i]['marker']['size'] = node_size
                 # Update label size
                 if 'textfont' in trace:
                     # Unknown/missing printers are 5/6 size
                     if 'rgba(128, 128, 128' in str(trace.get('textfont', {}).get('color', '')):
-                        patched_fig['data'][i]['textfont']['size'] = int(label_size * 5 / 6)
+                        patched_fig['data'][i]['textfont']['size'] = int(label_size * 1 / 2)
                     else:
                         patched_fig['data'][i]['textfont']['size'] = label_size
             return patched_fig
 
-        # The original update_visualizations callback should NOT include node-size-slider or label-size-slider as Inputs anymore.
-        @self.app.callback(
-            [Output('network-graph', 'figure'),
-             Output('similarity-heatmap', 'figure'),
-             Output('stats-panel', 'children')],
-            [Input('layout-dropdown', 'data'),
-             Input('font-type-dropdown', 'value'),
-             Input('umap-positions-store', 'data')],
-            [State('umap-n-neighbors', 'value'),
-             State('umap-min-dist', 'value'),
-             State('node-size-slider', 'value'),
-             State('label-size-slider', 'value'),
-             State('network-graph', 'figure'),
-             State('similarity-heatmap', 'figure')]
-        )
-        def update_visualizations(layout, font_type, umap_positions, n_neighbors, min_dist, node_size, label_size, current_network_fig, current_heatmap_fig):
-            ctx = dash.callback_context
-            triggered_inputs = [t['prop_id'].split('.')[0] for t in ctx.triggered] if ctx.triggered else []
-            layout = layout if layout is not None else 'umap'
-            threshold = 0.1  # Fixed threshold, or set as desired
-            if font_type == 'roman':
-                weight_matrix = self.w_rm
-                title_suffix = " (Roman)"
-            elif font_type == 'italic':
-                weight_matrix = self.w_it
-                title_suffix = " (Italic)"
-            else:
-                weight_matrix = (self.w_rm + self.w_it) / 2
-                title_suffix = " (Combined)"
-            umap_pos_array = None
-            if umap_positions is not None and len(umap_positions) > 0:
-                umap_pos_array = np.array(umap_positions)
-            elif layout == 'umap':
-                cache_key = f'umap_positions_{int(n_neighbors)}_{float(min_dist)}'
-                if cache_key in self._figures_cache:
-                    umap_pos_array = self._figures_cache[cache_key]
-            if font_type == 'roman':
-                n1hat_matrix = self.n1hat_rm
-            elif font_type == 'italic':
-                n1hat_matrix = self.n1hat_it
-            else:
-                n1hat_matrix = self.n1hat_rm + self.n1hat_it
-            umap_changed = (umap_positions is None or 
-                            self._last_umap_positions is None or 
-                            not np.array_equal(np.array(umap_positions), self._last_umap_positions))
-            total_connections = np.sum(weight_matrix > threshold)
-            connected_books = len(np.where(np.sum(weight_matrix > threshold, axis=0) > 0)[0])
-            stats = [
-                html.P(f"Total Books: {len(self.books)}"),
-                html.P(f"Connected Books (threshold > {threshold}): {connected_books}"),
-                html.P(f"Total Connections: {total_connections}"),
-                html.P(f"Symbols Analyzed: {len(self.symbs)}")
-            ]
-            
-            # Handle different update scenarios
-            only_font_type_changed = triggered_inputs == ['font-type-dropdown'] and not umap_changed and current_network_fig is not None and current_heatmap_fig is not None
-            
-            if only_font_type_changed:
-                # Minimal update: patch heatmap z/title and network edges
-                heatmap_patch = dash.Patch()
-                heatmap_patch['data'][0]['z'] = n1hat_matrix if n1hat_matrix is not None else weight_matrix
-                heatmap_patch['layout']['title']['text'] = f"Book Similarity Matrix ({font_type.capitalize()})"
-                
-                # Update customdata for marker traces
-                for i in range(1, len(current_heatmap_fig['data'])):
-                    trace = current_heatmap_fig['data'][i]
-                    impr = trace['name']
-                    indices = [j for j, p in enumerate(self.impr_names) if p == impr]
-                    types = [n1hat_matrix[j, j] if n1hat_matrix is not None else weight_matrix[j, j] for j in indices]
-                    heatmap_patch['data'][i]['customdata'] = np.array(types)[:, None]
-                
-                network_patch = self._update_network_edges(current_network_fig, weight_matrix, threshold, self.edge_opacity, n1hat_matrix, umap_pos_array, font_type)
-                
-                return network_patch, heatmap_patch, stats
-            elif umap_changed or current_network_fig is None:
-                network_fig = self._create_network_graph(
-                    weight_matrix, threshold, layout,
-                    n_neighbors=n_neighbors, min_dist=min_dist,
-                    umap_positions=umap_pos_array, edge_opacity=self.edge_opacity,
-                    n1hat_matrix=n1hat_matrix,
-                    marker_size=node_size, label_size=label_size, font_type=font_type
-                )
-                self._last_umap_positions = np.array(umap_positions) if umap_positions else None
-            else:
-                network_fig = self._update_network_edges(current_network_fig, weight_matrix, threshold, self.edge_opacity, n1hat_matrix, umap_pos_array, font_type)
-            heatmap_fig = self._get_cached_heatmap(font_type)
-            return network_fig, heatmap_fig, stats
 
         
         # Show/hide all printers in network graph legend
         @self.app.callback(
-            Output('network-graph', 'figure', allow_duplicate=True),
+            [Output('network-graph', 'figure', allow_duplicate=True),
+             Output('show-all-network-printers-btn', 'style'),
+             Output('hide-all-network-printers-btn', 'style')],
             [Input('show-all-network-printers-btn', 'n_clicks'),
              Input('hide-all-network-printers-btn', 'n_clicks')],
             [State('network-graph', 'figure')],
             prevent_initial_call=True
         )
         def toggle_all_network_printers(show_clicks, hide_clicks, current_fig):
-            if current_fig is None:
-                return dash.no_update
-            
             ctx = dash.callback_context
             if not ctx.triggered:
-                return dash.no_update
+                return dash.no_update, dash.no_update, dash.no_update
             
             trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
             show_all = trigger_id == 'show-all-network-printers-btn'
             
+            # Set button styles based on which is active
+            active_style_mr = {**active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            inactive_style_mr = {**inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            
+            show_style = {**active_btn_style} if show_all else {**inactive_btn_style}
+            hide_style = active_style_mr if not show_all else inactive_style_mr
+            
+            if not current_fig.get('data'):
+                return dash.no_update, show_style, hide_style
+            
             # Use dash.Patch for efficient update
             patched_fig = dash.Patch()
             
-            # Update visibility for all printer traces (skip edge trace at index 0)
+            # Update visibility for all printer traces (skip bin_ edge traces and selected_book_ traces)
             if current_fig.get('data'):
-                for i in range(1, len(current_fig['data'])):
-                    patched_fig['data'][i]['visible'] = True if show_all else 'legendonly'
+                for i, trace in enumerate(current_fig['data']):
+                    # Skip edge traces (named bin_0, bin_1, etc.) and selected book traces
+                    if trace.get('name', '').startswith('bin_') or trace.get('name', '').startswith('selected_'):
+                        continue
+                    # Use opacity instead of visible to preserve layout
+                    patched_fig['data'][i]['opacity'] = 1.0 if show_all else 0.0
             
-            return patched_fig
+            return patched_fig, show_style, hide_style
         
-        # Show/hide all printer overlays at once
+        # Sync selected books from dropdown to network graph and handle show/hide
         @self.app.callback(
-            Output('similarity-heatmap', 'figure', allow_duplicate=True),
+            [Output('network-graph', 'figure', allow_duplicate=True),
+             Output('network-selected-books-store', 'data'),
+             Output('show-selected-books-btn', 'style'),
+             Output('hide-selected-books-btn', 'style')],
+            [Input('additional-books-dropdown', 'value'),
+             Input('show-selected-books-btn', 'n_clicks'),
+             Input('hide-selected-books-btn', 'n_clicks')],
+            [State('network-graph', 'figure'),
+             State('network-selected-books-store', 'data'),
+             State('umap-positions-store', 'data'),
+             State('node-size-slider', 'value'),
+             State('label-size-slider', 'value'),
+             State('font-type-store', 'data'),
+             State('edge-opacity-slider', 'value'),
+             State('show-selected-books-btn', 'style'),
+             State('hide-selected-books-btn', 'style')],
+            prevent_initial_call=True
+        )
+        def handle_selected_books_in_network(selected_books, show_clicks, hide_clicks, current_fig, 
+                                              stored_books, umap_positions, node_size, label_size, font_type, edge_opacity,
+                                              show_btn_style, hide_btn_style):
+            if current_fig is None or not current_fig.get('data'):
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            
+            ctx = dash.callback_context
+            if not ctx.triggered:
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            
+            trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+            
+            # Button styles
+            active_style = {**active_btn_style, 'marginBottom': '8px'}
+            inactive_style = {**inactive_btn_style, 'marginBottom': '8px'}
+            active_style_mr = {**active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            inactive_style_mr = {**inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            
+            selected_books = selected_books or []
+            show_selected = trigger_id == 'show-selected-books-btn'
+            hide_selected = trigger_id == 'hide-selected-books-btn'
+            
+            patched_fig = dash.Patch()
+            
+            # Remove existing selected book traces and edges
+            data_to_keep = []
+            for trace in current_fig.get('data', []):
+                if not trace.get('name', '').startswith('selected_book_') and not trace.get('name', '').startswith('selected_edge_'):
+                    data_to_keep.append(trace)
+            patched_fig['data'] = data_to_keep
+            
+            # Determine current visibility state from existing traces
+            currently_showing = False
+            for trace in current_fig.get('data', []):
+                if trace.get('name', '').startswith('selected_book_'):
+                    currently_showing = True
+                    break
+            
+            # Determine desired visibility state based on trigger
+            if show_selected:
+                should_show = True
+            elif hide_selected:
+                should_show = False
+            elif trigger_id == 'additional-books-dropdown':
+                # Check which button is active by checking button styles
+                show_is_active = show_btn_style.get('backgroundColor') == '#2f4a84'
+                hide_is_active = hide_btn_style.get('backgroundColor') == '#2f4a84'
+                
+                # If "Show selected" is active and not currently showing, show them
+                if show_is_active and not currently_showing:
+                    should_show = True
+                # If "Hide selected" is active and currently showing, hide them
+                elif hide_is_active and currently_showing:
+                    should_show = False
+                else:
+                    # Otherwise preserve current state
+                    should_show = currently_showing
+            else:
+                # Default to hidden on first load
+                should_show = False
+            
+            # Add new selected book traces if showing and there are books to show
+            if selected_books and should_show:
+                umap_array = np.asarray(umap_positions, dtype=np.float32)
+                book_list = list(self.books)
+                
+                for book in selected_books:
+                    if book in book_list:
+                        book_idx = book_list.index(book)
+                        book_color = self._get_book_color(book)
+                        
+                        # Get printer name for hover
+                        printer_name = self.impr_names[book_idx] if book_idx < len(self.impr_names) else 'Unknown'
+                        if printer_name in ['n. nan', 'm. missing']:
+                            printer_name = 'Unknown'
+                        
+                        patched_fig['data'].append({
+                            'type': 'scatter',
+                            'x': [umap_array[book_idx, 0]],
+                            'y': [umap_array[book_idx, 1]],
+                            'mode': 'markers+text',
+                            'marker': {
+                                'symbol': 'star',
+                                'size': node_size * 1.3 if node_size else 18,
+                                'color': book_color,
+                                'line': {'width': 2, 'color': 'white'}
+                            },
+                            'text': [book],
+                            'textposition': 'top center',
+                            'textfont': {
+                                'size': label_size if label_size else 8,
+                                'color': book_color,
+                                'family': 'Arial, bold'
+                            },
+                            'hovertemplate': f'{book}<br>Printer: {printer_name}<extra></extra>',
+                            'name': f'selected_book_{book}',
+                            'showlegend': False
+                        })
+                
+                # Add colored edges for selected books using binned edges
+                bins = self._binned_edges.get(font_type, {})
+                book_list = list(self.books)
+                
+                # Use edge opacity from slider state
+                edge_opacity_val = edge_opacity if edge_opacity is not None else 1.0
+                
+                for book in selected_books:
+                    if book in book_list:
+                        book_idx = book_list.index(book)
+                        book_color = self._get_book_color(book)
+                        
+                        # Convert hex to RGB
+                        r = int(book_color[1:3], 16)
+                        g = int(book_color[3:5], 16)
+                        b = int(book_color[5:7], 16)
+                        
+                        # Find edges connected to this book from binned edges
+                        for bin_idx in range(10):
+                            bin_data = bins.get(bin_idx, {'edges': [], 'avg_w': 0})
+                            edges_in_bin = bin_data['edges']
+                            avg_w = bin_data['avg_w']
+                            
+                            if not edges_in_bin:
+                                continue
+                            
+                            # Vectorize edge filtering
+                            edges_array = np.array(edges_in_bin)
+                            mask = (edges_array[:, 0] == book_idx) | (edges_array[:, 1] == book_idx)
+                            matching_edges = edges_array[mask]
+                            
+                            if len(matching_edges) > 0:
+                                edges_x = []
+                                edges_y = []
+                                for i, j in matching_edges:
+                                    edges_x.extend([umap_array[i, 0], umap_array[j, 0], None])
+                                    edges_y.extend([umap_array[i, 1], umap_array[j, 1], None])
+                                
+                                # Use same opacity formula as bin edges
+                                opacity = min(1.0, avg_w * edge_opacity_val)
+                                color = f'rgba({r},{g},{b},{opacity})'
+                                patched_fig['data'].append({
+                                    'type': 'scatter',
+                                    'x': edges_x,
+                                    'y': edges_y,
+                                    'mode': 'lines',
+                                    'line': {'width': 1, 'color': color},
+                                    'showlegend': False,
+                                    'customdata': [avg_w],
+                                    'name': f'selected_edge_{book}_bin{bin_idx}',
+                                    'hoverinfo': 'skip'
+                                })
+                
+            # Update button styles based on desired visibility state (independent of whether there are books)
+            # Don't update button styles when dropdown changes (clicking nodes)
+            if trigger_id == 'additional-books-dropdown':
+                # Return no_update for button styles to preserve current state
+                return patched_fig, selected_books, dash.no_update, dash.no_update
+            elif should_show:
+                show_sel_style = active_style
+                hide_sel_style = inactive_style_mr
+            else:
+                show_sel_style = inactive_style
+                hide_sel_style = active_style_mr
+            
+            return patched_fig, selected_books, show_sel_style, hide_sel_style
+        
+        # Toggle heatmap printer visibility
+        @self.app.callback(
+            [Output('similarity-heatmap', 'figure', allow_duplicate=True),
+             Output('show-all-printers-btn', 'style'),
+             Output('hide-all-printers-btn', 'style')],
             [Input('show-all-printers-btn', 'n_clicks'),
-             Input('hide-all-printers-btn', 'n_clicks')],
+            Input('hide-all-printers-btn', 'n_clicks')],
             [State('similarity-heatmap', 'figure')],
             prevent_initial_call=True
         )
         def toggle_all_printers(show_clicks, hide_clicks, current_fig):
-            if current_fig is None:
-                return dash.no_update
+            # Button styles matching layout
+            active_style = {'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                           'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                           'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                           'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                           'width': '130px', 'minWidth': '130px'}
+            inactive_style = {'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                             'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                             'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                             'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                             'width': '130px', 'minWidth': '130px'}
             
+            if current_fig is None:
+                return dash.no_update, dash.no_update, dash.no_update
+
             ctx = dash.callback_context
             if not ctx.triggered:
-                return dash.no_update
-            
+                return dash.no_update, dash.no_update, dash.no_update
+
             trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
             show_all = trigger_id == 'show-all-printers-btn'
-            
-            try:
-                traces = current_fig.get('data', [])
-                shapes = current_fig.get('layout', {}).get('shapes', [])
-                
-                # Update all printer traces visibility (skip heatmap trace at index 0)
-                for i, trace in enumerate(traces):
-                    if i == 0:  # Skip heatmap
-                        continue
-                    trace['visible'] = True if show_all else 'legendonly'
-                
-                # # Update all shape overlays
-                # for shape in shapes:
-                #     shape_name = shape.get('name', '')
-                #     if shape_name.startswith('overlay_'):
-                #         current_fill = shape.get('fillcolor', '')
-                #         if 'rgba' in current_fill:
-                #             parts = current_fill.replace('rgba(', '').replace(')', '').split(',')
-                #             if len(parts) >= 3:
-                #                 if show_all:
-                #                     # Restore alpha to 0.3
-                #                     shape['fillcolor'] = f"rgba({parts[0]},{parts[1]},{parts[2]}, 0.3)"
-                #                 else:
-                #                     # Set alpha to 0 (keep RGB for later restore)
-                #                     shape['fillcolor'] = f"rgba({parts[0]},{parts[1]},{parts[2]}, 0)"
-                
-                # Explicitly preserve layout settings to prevent margin shifts
-                current_fig['layout']['uirevision'] = 'constant'
-                current_fig['layout']['xaxis']['automargin'] = False
-                current_fig['layout']['yaxis']['automargin'] = False
-                
-                return current_fig
-                
-            except Exception as e:
-                print(f"Error toggling all printers: {e}")
-                return dash.no_update
+
+            patched_fig = dash.Patch()
+            for i in range(1, len(current_fig['data'])):
+                # Skip overlay traces (they should always be visible)
+                if current_fig['data'][i].get('name', '').startswith('overlay_'):
+                    continue
+                # Use opacity instead of visible to preserve layout
+                patched_fig['data'][i]['opacity'] = 1.0 if show_all else 0.0
+
+            # Preserve layout settings
+            patched_fig['layout']['uirevision'] = 'constant'
+            patched_fig['layout']['xaxis']['automargin'] = False
+            patched_fig['layout']['yaxis']['automargin'] = False
+
+            # Set button styles based on action
+            if show_all:
+                show_style = active_style
+                hide_style = inactive_style
+            else:
+                show_style = inactive_style
+                hide_style = active_style
+
+            return patched_fig, show_style, hide_style
         
         # Dynamically adjust tick font size based on zoom level
         @self.app.callback(
@@ -1753,67 +1979,79 @@ class BookSimilarityDashboard:
         def adjust_tick_font_on_zoom(relayout_data, current_fig):
             if relayout_data is None or current_fig is None:
                 return dash.no_update
-            
+
             # Ignore autosize events
             if 'autosize' in relayout_data or relayout_data == {}:
                 return dash.no_update
-            
+
             try:
                 n_books = len(self.books)
                 default_size = max(6, min(12, 350/n_books))
-                
+
                 # Determine visible range
                 x_range = None
                 y_range = None
-                
+
                 # Check for zoom (range set)
                 if 'xaxis.range[0]' in relayout_data and 'xaxis.range[1]' in relayout_data:
                     x_range = (relayout_data['xaxis.range[0]'], relayout_data['xaxis.range[1]'])
                 if 'yaxis.range[0]' in relayout_data and 'yaxis.range[1]' in relayout_data:
                     y_range = (relayout_data['yaxis.range[0]'], relayout_data['yaxis.range[1]'])
-                
+
+                patched_fig = dash.Patch()
+
                 # Check for reset (double-click to reset zoom)
                 if 'xaxis.autorange' in relayout_data or 'yaxis.autorange' in relayout_data:
-                    # Reset to default font size
-                    current_fig['layout']['xaxis']['tickfont'] = {'size': default_size}
-                    current_fig['layout']['yaxis']['tickfont'] = {'size': default_size}
-                    current_fig['layout']['xaxis']['automargin'] = False
-                    current_fig['layout']['yaxis']['automargin'] = False
-                    return current_fig
-                
+                    # Reset to default font size and hide labels
+                    patched_fig['layout']['xaxis']['tickfont'] = {'size': default_size}
+                    patched_fig['layout']['yaxis']['tickfont'] = {'size': default_size}
+                    patched_fig['layout']['xaxis']['automargin'] = False
+                    patched_fig['layout']['yaxis']['automargin'] = False
+                    patched_fig['layout']['yaxis']['showticklabels'] = False
+                    patched_fig['layout']['margin']['l'] = 25  # Reset to original margin
+                    return patched_fig
+
                 # Calculate visible items
                 if x_range:
                     visible_x = max(1, abs(x_range[1] - x_range[0]))
                 else:
                     visible_x = n_books
-                
+
                 if y_range:
                     visible_y = max(1, abs(y_range[1] - y_range[0]))
                 else:
                     visible_y = n_books
-                
+
                 visible_items = min(visible_x, visible_y)
-                
+
                 # Scale font size - larger when zoomed in
                 if visible_items <= 5:
-                    font_size = 14
+                    font_size = 10
                 elif visible_items <= 10:
-                    font_size = 12
+                    font_size = 10
                 elif visible_items <= 20:
-                    font_size = 11
+                    font_size = 10
                 elif visible_items <= 35:
                     font_size = 10
                 else:
                     font_size = default_size
-                
+
                 # Update font sizes
-                current_fig['layout']['xaxis']['tickfont'] = {'size': font_size}
-                current_fig['layout']['yaxis']['tickfont'] = {'size': font_size}
-                current_fig['layout']['xaxis']['automargin'] = False
-                current_fig['layout']['yaxis']['automargin'] = False
+                patched_fig['layout']['xaxis']['tickfont'] = {'size': font_size, 'family': 'Arial Narrow, Arial, sans-serif'}
+                patched_fig['layout']['yaxis']['tickfont'] = {'size': font_size, 'family': 'Arial Narrow, Arial, sans-serif'}
+                patched_fig['layout']['xaxis']['automargin'] = False
+                patched_fig['layout']['yaxis']['automargin'] = False
                 
-                return current_fig
-                
+                # Show y-axis labels when zoomed in to 35 or fewer books
+                if visible_items <= 35:
+                    patched_fig['layout']['yaxis']['showticklabels'] = True
+                    patched_fig['layout']['margin']['l'] = 120  # Add left margin for labels
+                else:
+                    patched_fig['layout']['yaxis']['showticklabels'] = False
+                    patched_fig['layout']['margin']['l'] = 25  # Reset to original margin
+
+                return patched_fig
+
             except Exception as e:
                 print(f"Error adjusting font size: {e}")
                 return dash.no_update
@@ -1821,79 +2059,36 @@ class BookSimilarityDashboard:
         @self.app.callback(
             [Output('export-status', 'children'),
              Output('download-html', 'data')],
-            [Input('export-network-btn', 'n_clicks'),
-             Input('export-matrix-btn', 'n_clicks'),
-             Input('export-html-btn', 'n_clicks')],
-            [State('font-type-dropdown', 'value'),
+            [Input('export-html-btn', 'n_clicks')],
+            [State('font-type-store', 'data'),
              State('similarity-heatmap', 'figure'),
              State('network-graph', 'figure')]
         )
-        def export_data(network_clicks, matrix_clicks, html_clicks, font_type, heatmap_fig, network_fig):
-            ctx = dash.callback_context
-            if not ctx.triggered:
+        def export_data(html_clicks, font_type, heatmap_fig, network_fig):
+            if not html_clicks:
                 return "", None
             
-            button_id = ctx.triggered[0]['prop_id'].split('.')[0]
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
-            if button_id == 'export-network-btn':
-                # Export network data as JSON
+            # Export figures as interactive HTML for download
+            try:
+                import plotly.io as pio
+                
+                threshold = threshold if threshold is not None else 0.1
+                
+                # Compute stats for export
                 if font_type == 'roman':
-                    weight_matrix = self.w_rm
+                    n1hat = self.n1hat_rm
                 elif font_type == 'italic':
-                    weight_matrix = self.w_it
+                    n1hat = self.n1hat_it
                 else:
-                    weight_matrix = (self.w_rm + self.w_it) / 2
+                    n1hat = (self.n1hat_rm + self.n1hat_it) / 2
                 
-                network_data = {
-                    'books': self.books.tolist(),
-                    'weights': weight_matrix.tolist(),
-                    'imprinters': self.impr_names.tolist() if hasattr(self, 'impr_names') else [],
-                    'export_time': timestamp,
-                    'font_type': font_type
-                }
+                total_connections = np.sum(n1hat > threshold)
+                connected_books = len(np.where(np.sum(n1hat > threshold, axis=0) > 0)[0])
                 
-                filename = f'network_data_{font_type}_{timestamp}.json'
-                with open(filename, 'w') as f:
-                    json.dump(network_data, f, indent=2)
-                
-                return html.P(f"Network data exported to {filename}", style={'color': 'green'}), None
-            
-            elif button_id == 'export-matrix-btn':
-                # Export similarity matrix as CSV
-                if font_type == 'roman':
-                    weight_matrix = self.w_rm
-                elif font_type == 'italic':
-                    weight_matrix = self.w_it
-                else:
-                    weight_matrix = (self.w_rm + self.w_it) / 2
-                
-                df = pd.DataFrame(weight_matrix, index=self.books, columns=self.books)
-                filename = f'similarity_matrix_{font_type}_{timestamp}.csv'
-                df.to_csv(filename)
-                
-                return html.P(f"Similarity matrix exported to {filename}", style={'color': 'green'}), None
-            
-            elif button_id == 'export-html-btn':
-                # Export figures as interactive HTML for download
-                try:
-                    import plotly.io as pio
-                    
-                    threshold = threshold if threshold is not None else 0.1
-                    
-                    # Compute stats for export
-                    if font_type == 'roman':
-                        weight_matrix = self.w_rm
-                    elif font_type == 'italic':
-                        weight_matrix = self.w_it
-                    else:
-                        weight_matrix = (self.w_rm + self.w_it) / 2
-                    
-                    total_connections = np.sum(weight_matrix > threshold)
-                    connected_books = len(np.where(np.sum(weight_matrix > threshold, axis=0) > 0)[0])
-                    
-                    # Create combined HTML with both figures
-                    html_content = f"""<!DOCTYPE html>
+                # Create combined HTML with both figures
+                html_content = f"""<!DOCTYPE html>
 <html>
 <head>
     <title>Book Typography Similarity Analysis - {timestamp}</title>
@@ -1933,19 +2128,17 @@ class BookSimilarityDashboard:
 </body>
 </html>"""
                     
-                    filename = f'dashboard_export_{font_type}_{timestamp}.html'
-                    
-                    return html.P(f"✅ HTML export ready - download will start automatically!", style={'color': 'green', 'fontWeight': 'bold'}), dict(content=html_content, filename=filename)
-                    
-                except Exception as e:
-                    return html.P(f"❌ Export failed: {str(e)}", style={'color': 'red'}), None
-            
-            return "", None
+                filename = f'dashboard_export_{font_type}_{timestamp}.html'
+                
+                return html.P(f"✅ HTML export ready - download will start automatically!", style={'color': 'green', 'fontWeight': 'bold'}), dict(content=html_content, filename=filename)
+                
+            except Exception as e:
+                return html.P(f"❌ Export failed: {str(e)}", style={'color': 'red'}), None
         
         # Callback to show letter comparisons - shows ALL cached images instantly
         @self.app.callback(
             Output('letter-comparison-panel', 'children'),
-            [Input('font-type-dropdown', 'value'),
+            [Input('font-type-store', 'data'),
              Input('letter-filter', 'value'),
              Input('additional-books-dropdown', 'value')],
             prevent_initial_call=True
@@ -1990,15 +2183,23 @@ class BookSimilarityDashboard:
                     printer_name = self.impr_names[book_idx[0]] if len(book_idx) > 0 else ''
                     if printer_name in ['n. nan', 'm. missing']:
                         printer_name = 'Unknown'
+                    
+                    # Get book color with light alpha for background
+                    book_color = self._get_book_color(book)
+                    r = int(book_color[1:3], 16)
+                    g = int(book_color[3:5], 16)
+                    b = int(book_color[5:7], 16)
+                    bg_color = f'rgba({r}, {g}, {b}, 0.35)'
+                    
                     header_items.append(
                         html.Div([
-                            html.P(f"{book}", style={'fontSize': '10px', 'fontWeight': 'bold', 'margin': '0', 'wordWrap': 'break-word'}),
+                            html.P(f"{book}", style={'fontSize': '10px', 'fontWeight': 'bold', 'margin': '0', 'wordWrap': 'break-word', 'color': '#333'}),
                             html.P(f"{printer_name}", style={'fontSize': '9px', 'color': '#666', 'margin': '0'})
-                        ], style={'display': 'inline-block', 'width': col_width, 'textAlign': 'center', 'verticalAlign': 'top'})
+                        ], style={'display': 'inline-block', 'width': col_width, 'textAlign': 'center', 'verticalAlign': 'top', 'backgroundColor': bg_color, 'padding': '5px', 'borderRadius': '4px', 'boxSizing': 'border-box'})
                     )
                 
                 comparison_content = [
-                    html.Div(header_items, style={'marginBottom': '10px'}),
+                    html.Div(header_items, style={'marginBottom': '10px', 'display': 'flex', 'gap': '2px', 'justifyContent': 'center'}),
                     html.P(f"Viewing {n_books} book{'s' if n_books > 1 else ''}", style={'textAlign': 'center', 'fontSize': '11px', 'marginBottom': '10px', 'color': '#666'}),
                 ]
                 
@@ -2037,7 +2238,16 @@ class BookSimilarityDashboard:
 
                             # Build image elements for each book
                             book_columns = []
-                            for book_images in all_book_images:
+                            for idx, book_images in enumerate(all_book_images):
+                                book = books_to_compare[idx]
+                                
+                                # Get book color with light alpha for background
+                                book_color = self._get_book_color(book)
+                                r = int(book_color[1:3], 16)
+                                g = int(book_color[3:5], 16)
+                                b = int(book_color[5:7], 16)
+                                bg_color = f'rgba({r}, {g}, {b}, 0.35)'
+                                
                                 img_elements = []
                                 for img_path, encoded in book_images:
                                     img_elements.append(
@@ -2050,13 +2260,13 @@ class BookSimilarityDashboard:
                                     img_elements.append(html.Span("—", style={'color': '#999', 'fontSize': '24px'}))
 
                                 book_columns.append(
-                                    html.Div(img_elements, style={'width': col_width, 'display': 'inline-block', 'textAlign': 'center', 'verticalAlign': 'middle'})
+                                    html.Div(img_elements, style={'width': col_width, 'display': 'inline-block', 'textAlign': 'center', 'verticalAlign': 'middle', 'backgroundColor': bg_color, 'padding': '5px', 'borderRadius': '4px', 'boxSizing': 'border-box'})
                                 )
 
                             comparison_content.append(
                                 html.Div([
                                     html.H5(f"'{letter}'", style={'marginBottom': '5px', 'textAlign': 'center', 'fontSize': '14px', 'fontWeight': 'bold'}),
-                                    html.Div(book_columns, style={'marginBottom': '8px', 'paddingBottom': '8px', 'borderBottom': '1px solid #eee'})
+                                    html.Div(book_columns, style={'marginBottom': '8px', 'paddingBottom': '8px', 'borderBottom': '1px solid #eee', 'display': 'flex', 'gap': '2px', 'justifyContent': 'center'})
                                 ])
                             )
                         

@@ -1,0 +1,73 @@
+/* Slider track (the line) */
+.rc-slider-track {
+  background-color: #2f4a84;  /* your color */
+}
+
+/* Slider handle (the knob) */
+/* .rc-slider-handle {
+  border-color: #2f4a84;
+  background-color: 'white';
+} */
+
+/* Slider handle (the knob) */
+/* .rc-slider-handle-active {
+  border-color: #2f4a84;
+  background-color: 'white';
+} */
+
+/* When hovering */
+/* .rc-slider-handle:hover {
+  border-color: #2f4a84;
+} */
+
+/* Normal handle */
+.rc-slider-handle {
+  border-color: #2f4a84 !important;
+  background-color: white !important;
+}
+
+/* Hover */
+.rc-slider-handle:hover {
+  border-color: #2f4a84 !important;
+}
+
+/* While dragging */
+.rc-slider-handle:active {
+  border-color: #2f4a84 !important;
+}
+
+/* After release (focus state) */
+.rc-slider-handle:focus {
+  border-color: #2f4a84 !important;
+  background-color: white !important;
+}
+
+/* Rail (inactive part) */
+.rc-slider-rail {
+  background-color: #B2A57E;
+}
+
+/* Mark dots (inactive) */
+.rc-slider-dot {
+  border-color: #B2A57E;     /* outline color */
+  background-color: #DBD1B5;  /* fill color */
+}
+
+/* Active mark dots (before handle) */
+.rc-slider-dot-active {
+  border-color: #2f4a84;
+  background-color: #2f4a84;
+}
+
+.compact-slider .rc-slider {
+  margin-top: 0px !important;
+  margin-bottom: 0px !important;
+}
+
+.compact-slider .rc-slider-mark {
+  margin-top: 0px !important;
+}
+
+.compact-slider .rc-slider-mark-text {
+  font-size: 10px;
+}
