@@ -534,11 +534,12 @@ class BookSimilarityDashboard:
         
         return fig
     
-    def _update_network_edges(self, current_fig, edge_opacity, umap_pos_array, font_type):
+    def _update_network_edges(self, current_fig, edge_opacity, umap_pos_array, font_type, selected_books=None):
         """Update edge traces in the network figure for new weight_matrix and threshold, keeping node traces.
         
         Args:
             umap_pos_array: numpy array of UMAP positions (not list)
+            selected_books: list of selected book names to recreate edges for (default None)
         """
         # Use binned edges for the font type
         bins = self._binned_edges.get(font_type, {})
@@ -546,7 +547,11 @@ class BookSimilarityDashboard:
         # Use Patch for efficient update
         patched = dash.Patch()
         
-        # Update bin traces by iterating through data and checking names
+        # Use provided selected_books or default to empty list
+        if selected_books is None:
+            selected_books = []
+        
+        # Update bin traces and remove selected_edge_ traces
         for i, trace in enumerate(current_fig['data']):
             if trace['name'].startswith('bin_'):
                 bin_idx = int(trace['name'].split('_')[1])
@@ -570,6 +575,59 @@ class BookSimilarityDashboard:
                     patched['data'][i]['x'] = x_all
                     patched['data'][i]['y'] = y_all
                     patched['data'][i]['line']['color'] = color
+            elif trace['name'].startswith('selected_edge_'):
+                # Remove selected edges - they will be recreated
+                patched['data'][i]['x'] = []
+                patched['data'][i]['y'] = []
+        
+        # Recreate selected book edges with new font type
+        if selected_books:
+            book_list = list(self.books)
+            for book in selected_books:
+                if book in book_list:
+                    book_idx = book_list.index(book)
+                    book_color = self._get_book_color(book)
+                    
+                    # Convert hex to RGB
+                    r = int(book_color[1:3], 16)
+                    g = int(book_color[3:5], 16)
+                    b = int(book_color[5:7], 16)
+                    
+                    # Add edges for this book from binned edges
+                    for bin_idx in range(10):
+                        bin_data = bins.get(bin_idx, {'edges': [], 'avg_w': 0})
+                        edges_in_bin = bin_data['edges']
+                        avg_w = bin_data['avg_w']
+                        
+                        if not edges_in_bin:
+                            continue
+                        
+                        # Vectorize edge filtering
+                        edges_array = np.array(edges_in_bin)
+                        mask = (edges_array[:, 0] == book_idx) | (edges_array[:, 1] == book_idx)
+                        matching_edges = edges_array[mask]
+                        
+                        if len(matching_edges) > 0:
+                            edges_x = []
+                            edges_y = []
+                            for i, j in matching_edges:
+                                edges_x.extend([umap_pos_array[i, 0], umap_pos_array[j, 0], None])
+                                edges_y.extend([umap_pos_array[i, 1], umap_pos_array[j, 1], None])
+                            
+                            # Selected edges use avg_w directly for opacity (not affected by edge_opacity slider)
+                            opacity = min(1.0, avg_w)
+                            color = f'rgba({r},{g},{b},{opacity})'
+                            patched['data'].append({
+                                'type': 'scatter',
+                                'x': edges_x,
+                                'y': edges_y,
+                                'mode': 'lines',
+                                'line': {'width': 1, 'color': color},
+                                'showlegend': False,
+                                'customdata': [avg_w],
+                                'name': f'selected_edge_{book}_bin{bin_idx}',
+                                'hoverinfo': 'skip'
+                            })
         
         return patched
     
@@ -1239,10 +1297,14 @@ class BookSimilarityDashboard:
             [State('umap-positions-store', 'data'),
              State('network-graph', 'figure'),
              State('similarity-heatmap', 'figure'),
-             State('edge-opacity-slider', 'value')],
+             State('edge-opacity-slider', 'value'),
+             State('additional-books-dropdown', 'value'),
+             State('node-size-slider', 'value'),
+             State('label-size-slider', 'value')],
             prevent_initial_call=False
         )
-        def update_visualizations(font_type, umap_pos_array, current_network_fig, current_heatmap_fig, edge_opacity):
+        def update_visualizations(font_type, umap_pos_array, current_network_fig, current_heatmap_fig, edge_opacity, 
+                                  selected_books, node_size, label_size):
             # Handle None case for UMAP positions (load default if store not initialized)
             store_update = dash.no_update
             if umap_pos_array is None:
@@ -1270,7 +1332,8 @@ class BookSimilarityDashboard:
                 network_fig = self._create_network_graph(umap_array, edge_opacity or 1.0, font_type=font_type)
             else:
                 # Minimal update: patch network edges - pass array directly
-                network_fig = self._update_network_edges(current_network_fig, edge_opacity or 1.0, umap_array, font_type)
+                # This will also handle updating selected book edges with new font type
+                network_fig = self._update_network_edges(current_network_fig, edge_opacity or 1.0, umap_array, font_type, selected_books)
             
             if not current_heatmap_fig.get('data'):
                 # Full redraw
@@ -1646,7 +1709,10 @@ class BookSimilarityDashboard:
                     customdata = trace.get('customdata', [])
                     if customdata and len(customdata) > 0:
                         w = customdata[0]
-                        new_a = min(1.0, w * float(edge_opacity))
+                        if name.startswith('selected_edge_'):
+                            new_a = min(1.0, w)
+                        else:
+                            new_a = min(1.0, w * float(edge_opacity))
                         color = f'rgba(100,100,100,{new_a})'
                         patched['data'][i]['line']['color'] = color
 
@@ -1885,14 +1951,14 @@ class BookSimilarityDashboard:
                                     edges_y.extend([umap_array[i, 1], umap_array[j, 1], None])
                                 
                                 # Use same opacity formula as bin edges
-                                opacity = min(1.0, avg_w * edge_opacity_val)
+                                opacity = min(1.0, avg_w)
                                 color = f'rgba({r},{g},{b},{opacity})'
                                 patched_fig['data'].append({
                                     'type': 'scatter',
                                     'x': edges_x,
                                     'y': edges_y,
                                     'mode': 'lines',
-                                    'line': {'width': 1, 'color': color},
+                                    'line': {'width': 2, 'color': color},
                                     'showlegend': False,
                                     'customdata': [avg_w],
                                     'name': f'selected_edge_{book}_bin{bin_idx}',
