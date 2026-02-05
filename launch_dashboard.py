@@ -22,7 +22,7 @@ def save_figures_cache(figures_dict):
     }
     with open(FIGURES_CACHE_FILE, 'wb') as f:
         pickle.dump(cache_data, f)
-    print(f"✓ Saved figures cache to: {FIGURES_CACHE_FILE}")
+    print(f"Saved figures cache to: {FIGURES_CACHE_FILE}")
 
 def load_figures_cache():
     """Load pre-computed figures from cache"""
@@ -38,10 +38,10 @@ def load_figures_cache():
         else:
             # Old format: 'figures' contains full figures
             figures_cache = cache_data.get('figures')
-        print(f"✓ Loaded figures from cache (version: {version}, saved: {cache_data.get('cached_at', 'unknown')})")
+        print(f"Loaded figures from cache (version: {version}, saved: {cache_data.get('cached_at', 'unknown')})")
         return figures_cache
     except Exception as e:
-        print(f"⚠ Figures cache load failed: {e}")
+        print(f"WARNING: Figures cache load failed: {e}")
         return None
     
 def load_real_data_into_dashboard(dashboard):
@@ -52,7 +52,7 @@ def load_real_data_into_dashboard(dashboard):
     print("✓ Data loaded into dashboard")
     
     # # Profile memory usage
-    # print("\n📊 Profiling memory usage...")
+    # print("\nProfiling memory usage...")
     # get_dashboard_memory(dashboard)
     # get_object_memory()
 

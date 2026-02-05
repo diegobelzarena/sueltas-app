@@ -13,6 +13,9 @@ import glob
 import pickle
 from datetime import datetime
 import time
+import threading
+import uuid
+import tempfile
 
 try:
     import umap
@@ -25,6 +28,9 @@ class BookSimilarityDashboard:
     # Cache size limits for memory optimization
     MAX_FIGURE_CACHE_SIZE = 10  # Limit total cached figure/aux entries
     MAX_UMAP_CACHE_SIZE = 5     # Limit cached UMAP parameter combinations
+
+    # Default settings for edge cache behavior
+    EDGE_CACHE_MAX_FILES = 3  # Keep at most 3 edge cache files by default (LRU)
 
     def __init__(self):
         self.books = None
@@ -40,6 +46,15 @@ class BookSimilarityDashboard:
         self._cache_dir = './images_cache/'  # Directory for per-book cache files
         os.makedirs(self._cache_dir, exist_ok=True)
 
+        # Track last selected font to know when to reload edge caches
+        self._last_font_type = None
+
+        # Lock to protect concurrent cache writes
+        self._edge_cache_lock = threading.Lock()
+
+        # Option: keep all caches in memory if True (useful for debugging)
+        self.KEEP_ALL_EDGE_CACHES = False
+
         self.app = dash.Dash(__name__, suppress_callback_exceptions=True)
         self.app.layout = html.Div("Loading data, please wait…")
         
@@ -48,69 +63,225 @@ class BookSimilarityDashboard:
         Initialize the dashboard with your data.
         """
         
-        self.n1hat_it = np.load('./n1hat_it_matrix_ordered.npy')
-        self.n1hat_rm = np.load('./n1hat_rm_matrix_ordered.npy')
-        self.books = np.load('./books_dashboard_ordered.npy')
-        self.impr_names = np.load('./impr_names_dashboard_ordered.npy')
-        self.symbs = np.load('./symbs_dashboard.npy')
+        self.n1hat_it = np.load('./n1hat_it_matrix_ordered.npy', mmap_mode='r')
+        self.n1hat_rm = np.load('./n1hat_rm_matrix_ordered.npy', mmap_mode='r')
+        self.books = np.load('./books_dashboard_ordered.npy', mmap_mode='r')
+        self.impr_names = np.load('./impr_names_dashboard_ordered.npy', mmap_mode='r')
+        self.symbs = np.load('./symbs_dashboard.npy', mmap_mode='r')
         print(" Loaded ordered .npy files")
         
-        # Load weight matrices as memory-mapped arrays (not copied to RAM)
-        w_rm_mmap = np.load('./w_rm_matrix_ordered.npy', mmap_mode='r')
-        w_it_mmap = np.load('./w_it_matrix_ordered.npy', mmap_mode='r')
-        print(f" Weight matrices loaded as memory-mapped (not in RAM)")
-        
+        # Decide whether to load weight memmaps: only if edge caches are missing
+        fonts = ['roman', 'italic', 'combined']
+        need_edges = any(not os.path.exists(self._edge_cache_path(font, self.top_k, self.n_bins)) for font in fonts)
+        # Check for per-font combined UMAP file (we only load combined positions at startup if present)
+        combined_umap_file = f'./umap_combined_50_0.5.npy'
+        combined_umap_present = os.path.exists(combined_umap_file)
+
         # Check the dtype of n1hat_rm, n1hat_it
         print(f"n1hat_rm dtype: {self.n1hat_rm.dtype if self.n1hat_rm is not None else 'None'}, n1hat_it dtype: {self.n1hat_it.dtype if self.n1hat_it is not None else 'None'}")
- 
-        # Pre-compute top edges for network graphs using mmap arrays
-        self._precompute_edges(w_rm_mmap, w_it_mmap,
-                               top_k=self.top_k, n_bins=self.n_bins)
-        
+
+        if need_edges:
+            # Only load weight memmaps when needed for missing caches
+            w_rm_mmap = np.load('./w_rm_matrix_ordered.npy', mmap_mode='r')
+            w_it_mmap = np.load('./w_it_matrix_ordered.npy', mmap_mode='r')
+            self._w_rm_mmap = w_rm_mmap
+            self._w_it_mmap = w_it_mmap
+            print("Loaded weight matrices as memory-mapped (needed for missing caches).")
+        else:
+            # Keep attributes None to signal weights are not loaded
+            self._w_rm_mmap = None
+            self._w_it_mmap = None
+            print("Weight matrices not loaded (edge caches present).")
+
         # Initialize printer markers dictionary (lightweight, no trace objects)
         self._printer_markers = self._get_printer_colors_dict()
                                 
         # Image cache removed for memory efficiency
         # Images will be loaded on-demand without caching
         self._load_metadata_for_letter_images()  # 3 images per letter
-                
-        self._setup_layout(w_combined=w_rm_mmap + w_it_mmap)
+
+        # Setup layout. Load combined UMAP positions only if the per-font combined UMAP file exists.
+        # We do NOT compute UMAP at startup if the file is missing; computation is deferred to user action.
+        self._setup_layout()
         self._setup_callbacks()
         
     def _precompute_edges(self, w_rm, w_it, top_k=10000, n_bins=10):
-        """Precompute top edges for network graphs to speed up rendering."""
-        # Precompute top edges and binned edges for network graphs (top 10000 by weight from each font type matrix)
-        self._top_edges = {}
-        self._binned_edges = {}
-        
-        for font_type in ['roman', 'italic', 'combined']:
-            if font_type == 'roman':
-                matrix = w_rm
-            elif font_type == 'italic':
-                matrix = w_it
+        """Backward-compatible wrapper — compute edges for all fonts (kept for explicit use).
+
+        Prefer using _ensure_precomputed_edges(font_type) which will lazily load or compute and cache
+        per-font edges without computing all fonts at startup.
+        """
+        # Compute edges for all font_types if explicitly requested
+        for font in ['roman', 'italic', 'combined']:
+            self._compute_edges_for_font(font, w_rm, w_it, top_k=top_k, n_bins=n_bins)
+
+    def _edge_cache_path(self, font_type, top_k, n_bins):
+        """Return cache path for given font/top_k/n_bins."""
+        safe_name = f"edges_cache_{font_type}_top{top_k}_bins{n_bins}.pkl"
+        return os.path.join(self._cache_dir, safe_name)
+
+    def _ensure_precomputed_edges(self, font_type='combined', top_k=None, n_bins=None):
+        """Ensure _top_edges and _binned_edges exist for a given font_type.
+
+        Loads from cache if present, otherwise computes and saves to cache. Keeps only one font in memory
+        by default to limit memory use. Returns (top_edges, binned_edges).
+        """
+        if top_k is None:
+            top_k = self.top_k
+        if n_bins is None:
+            n_bins = self.n_bins
+
+        if getattr(self, '_top_edges', None) is None:
+            self._top_edges = {}
+        if getattr(self, '_binned_edges', None) is None:
+            self._binned_edges = {}
+
+        # If already have it in memory, return
+        if font_type in self._top_edges and len(self._top_edges[font_type]) > 0:
+            return self._top_edges[font_type], self._binned_edges.get(font_type, {})
+
+        cache_path = self._edge_cache_path(font_type, top_k, n_bins)
+        # Try load from cache atomically
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'rb') as f:
+                    data = pickle.load(f)
+                self._top_edges[font_type] = data.get('top_edges', [])
+                self._binned_edges[font_type] = data.get('binned_edges', {})
+                print(f"Loaded edge cache for font '{font_type}' from {cache_path}")
+                # Optionally prune other fonts from memory to keep memory low
+                if not getattr(self, 'KEEP_ALL_EDGE_CACHES', False):
+                    for k in list(self._top_edges.keys()):
+                        if k != font_type:
+                            self._top_edges.pop(k, None)
+                            self._binned_edges.pop(k, None)
+                return self._top_edges[font_type], self._binned_edges[font_type]
+            except Exception as e:
+                print(f"Warning: Failed to load edge cache {cache_path}: {e}")
+                # Continue to compute if cache load fails
+                pass
+
+        # Compute and cache (with atomic write and LRU prunning)
+        print(f"Computing edge cache for font '{font_type}' (top_k={top_k}, n_bins={n_bins})...")
+        # Ensure weight memmaps are loaded (lazy load on demand)
+        if getattr(self, '_w_rm_mmap', None) is None or getattr(self, '_w_it_mmap', None) is None:
+            try:
+                self._w_rm_mmap = np.load('./w_rm_matrix_ordered.npy', mmap_mode='r')
+                self._w_it_mmap = np.load('./w_it_matrix_ordered.npy', mmap_mode='r')
+                print("Loaded weight matrices as memory-mapped (needed for edge computation).")
+            except Exception as e:
+                print(f"Warning: Failed to load weight memmaps for edges: {e}")
+                raise
+
+        top_edges, binned_edges = self._compute_edges_for_font(font_type, self._w_rm_mmap, self._w_it_mmap, top_k=top_k, n_bins=n_bins)
+        # Write atomically with lock
+        try:
+            tmp_name = None
+            with self._edge_cache_lock:
+                fd, tmp_name = tempfile.mkstemp(prefix='edges_cache_', dir=self._cache_dir)
+                os.close(fd)
+                with open(tmp_name, 'wb') as f:
+                    pickle.dump({'top_edges': top_edges, 'binned_edges': binned_edges}, f, protocol=pickle.HIGHEST_PROTOCOL)
+                # Atomic replace
+                os.replace(tmp_name, cache_path)
+                print(f"Saved edge cache to {cache_path}")
+                # Prune old cache files if above limit (use LRU by mtime)
+                if not getattr(self, 'KEEP_ALL_EDGE_CACHES', False):
+                    try:
+                        self._prune_edge_caches(self.EDGE_CACHE_MAX_FILES)
+                    except Exception as e:
+                        print(f"Warning: prune edge caches failed: {e}")
+        except Exception as e:
+            print(f"Warning: Could not write edge cache {cache_path}: {e}")
+            try:
+                if tmp_name and os.path.exists(tmp_name):
+                    os.remove(tmp_name)
+            except Exception:
+                pass
+
+        return top_edges, binned_edges
+
+    def _compute_edges_for_font(self, font_type, w_rm, w_it, top_k=10000, n_bins=10):
+        """Compute (and return) top_edges/binned_edges for a given font without creating a full combined matrix.
+
+        This function uses upper-triangular indices and np.argpartition to find top-k efficiently and
+        avoids creating large temporary full (n,n) arrays by operating on the upper triangle directly.
+        """
+        n = w_rm.shape[0]
+        i_indices, j_indices = np.triu_indices(n, k=1)
+
+        if font_type == 'roman':
+            edge_weights = w_rm[i_indices, j_indices]
+        elif font_type == 'italic':
+            edge_weights = w_it[i_indices, j_indices]
+        else:  # combined
+            # Avoid materializing (w_rm + w_it) as a full matrix; compute only upper-triangle combined weights
+            edge_weights = (w_rm[i_indices, j_indices] + w_it[i_indices, j_indices]) / 2.0
+
+        if edge_weights.size == 0:
+            self._top_edges[font_type] = []
+            self._binned_edges[font_type] = {i: {'edges': [], 'avg_w': 0} for i in range(n_bins)}
+            return self._top_edges[font_type], self._binned_edges[font_type]
+
+        k = min(top_k, edge_weights.size)
+        # Use argpartition to get unsorted top-k indices, then sort those descending
+        idx_top = np.argpartition(-edge_weights, k - 1)[:k]
+        idx_top_sorted = idx_top[np.argsort(edge_weights[idx_top])[::-1]]
+
+        top_edges = [(int(i_indices[idx]), int(j_indices[idx])) for idx in idx_top_sorted]
+        self._top_edges[font_type] = top_edges
+
+        # Compute weights for top edges to bin them
+        top_edge_weights = edge_weights[idx_top_sorted]
+        if top_edge_weights.size == 0 or top_edge_weights.max() == top_edge_weights.min():
+            binned = {i: {'edges': [], 'avg_w': 0} for i in range(n_bins)}
+            self._binned_edges[font_type] = binned
+            return top_edges, binned
+
+        bins = np.linspace(top_edge_weights.min(), top_edge_weights.max(), n_bins + 1)
+        bin_indices = np.digitize(top_edge_weights, bins) - 1
+        bin_indices = np.clip(bin_indices, 0, n_bins - 1)
+
+        binned = {}
+        for bin_idx in range(n_bins):
+            sel = np.where(bin_indices == bin_idx)[0]
+            edges_in_bin = [top_edges[i] for i in sel]
+            if edges_in_bin:
+                # compute average weight from memmaps for these edges
+                # Avoid large temporaries: compute weights in a small loop
+                s = 0.0
+                for (ii, jj) in edges_in_bin:
+                    if font_type == 'roman':
+                        s += float(w_rm[ii, jj])
+                    elif font_type == 'italic':
+                        s += float(w_it[ii, jj])
+                    else:
+                        s += float((w_rm[ii, jj] + w_it[ii, jj]) / 2.0)
+                avg_w = float(s / len(edges_in_bin))
             else:
-                matrix = (w_rm + w_it) / 2
-            upper_mask = np.triu(np.ones_like(matrix, dtype=bool), k=1)
-            edge_weights = matrix[upper_mask]
-            i_indices, j_indices = np.where(upper_mask)
-            # Sort by weight descending
-            sorted_indices = np.argsort(edge_weights)[::-1]
-            self._top_edges[font_type] = [(i_indices[idx], j_indices[idx]) for idx in sorted_indices[:top_k]]
-            
-            # Now compute binned edges using the top edges
-            top_edge_weights = np.array([matrix[i, j] for i, j in self._top_edges[font_type]])
-            if len(top_edge_weights) == 0 or top_edge_weights.max() == top_edge_weights.min():
-                self._binned_edges[font_type] = {i: {'edges': [], 'avg_w': 0} for i in range(n_bins)}
-                continue
-            bins = np.linspace(top_edge_weights.min(), top_edge_weights.max(), n_bins + 1)
-            bin_indices = np.digitize(top_edge_weights, bins) - 1
-            bin_indices = np.clip(bin_indices, 0, n_bins - 1)
-            self._binned_edges[font_type] = {}
-            for bin_idx in range(n_bins):
-                indices = np.where(bin_indices == bin_idx)[0]
-                edges_in_bin = [self._top_edges[font_type][i] for i in indices]
-                avg_w = np.mean([matrix[i, j] for i, j in edges_in_bin]) if edges_in_bin else 0
-                self._binned_edges[font_type][bin_idx] = {'edges': edges_in_bin, 'avg_w': avg_w}
+                avg_w = 0
+            binned[bin_idx] = {'edges': edges_in_bin, 'avg_w': avg_w}
+
+        self._binned_edges[font_type] = binned
+        return top_edges, binned
+
+    def _prune_edge_caches(self, max_files):
+        """Prune oldest edge cache files so only `max_files` remain.
+
+        Uses file modification time as LRU heuristic and removes oldest cache files first.
+        """
+        # Find all edge cache files
+        pattern = os.path.join(self._cache_dir, 'edges_cache_*.pkl')
+        files = sorted(glob.glob(pattern), key=lambda p: os.path.getmtime(p))
+        if len(files) <= max_files:
+            return
+        to_remove = files[:len(files) - max_files]
+        for f in to_remove:
+            try:
+                os.remove(f)
+                print(f"Pruned old edge cache: {f}")
+            except Exception as e:
+                print(f"Warning: failed to remove cache file {f}: {e}")
     
     def _get_printer_colors_dict(self):
         """Get lightweight printer color/marker dictionary (no trace objects)."""
@@ -149,24 +320,123 @@ class BookSimilarityDashboard:
             )
             traces.append(trace)
         return traces
+    
                 
-    def _load_umap_positions(self, w_combined=None, n_neighbors=50, min_dist=0.5):
-        
+    def _load_umap_positions(self, font_type='combined', w_rm=None, w_it=None, w_combined=None, n_neighbors=50, min_dist=0.5, compute_if_missing=False):
+        """Load or compute UMAP positions for a given font_type ('roman', 'italic', 'combined').
+
+        This creates/uses per-font cached files named like: ./umap_{font_type}_{n_neighbors}_{min_dist}.npy
+        By default, callers with no font_type supplied get 'combined' (keeps startup behavior).
+        The 'compute_if_missing' flag controls whether missing UMAP files are computed or deferred.
+        """
+        # filename includes font type to allow per-font UMAP position caches
+        umap_file = f'./umap_{font_type}_{n_neighbors}_{min_dist}.npy'
+
         # if file exists, load it
-        umap_file = f'./umap_{n_neighbors}_{min_dist}.npy'
         if os.path.exists(umap_file):
             umap_positions = np.load(umap_file)
-            print(f"✓ Loaded UMAP positions from {umap_file}")
-        else:
-            print("Computing UMAP positions...")
-            umap_positions = self._compute_umap_positions(1 - (w_combined.astype(np.float64)),
-                                                            n_neighbors=n_neighbors,
-                                                            min_dist=min_dist)
-            np.save(umap_file, umap_positions)
-            print(f"✓ Saved UMAP positions to {umap_file}")
-            
+            print(f"Loaded UMAP positions from {umap_file}")
+            print(f"UMAP positions shape: {umap_positions.shape}")
+            return self._orient_umap_positions(umap_positions)
+
+        if not compute_if_missing:
+            print(f"UMAP file {umap_file} missing — computation deferred until requested.")
+            return None
+
+        print("Computing UMAP positions...")
+        # Determine which weight sources to use depending on font_type
+        # If required memmaps are not provided, try lazy-loading from self
+        if font_type == 'roman':
+            if w_rm is None:
+                if getattr(self, '_w_rm_mmap', None) is None:
+                    try:
+                        self._w_rm_mmap = np.load('./w_rm_matrix_ordered.npy', mmap_mode='r')
+                        print("Loaded roman weight memmap for UMAP.")
+                    except Exception as e:
+                        print(f"Warning: Failed to load roman weight memmap: {e}")
+                        return None
+                w = self._w_rm_mmap
+            else:
+                w = w_rm
+            dm = 1.0 - w.astype(np.float32, copy=False)
+
+        elif font_type == 'italic':
+            if w_it is None:
+                if getattr(self, '_w_it_mmap', None) is None:
+                    try:
+                        self._w_it_mmap = np.load('./w_it_matrix_ordered.npy', mmap_mode='r')
+                        print("Loaded italic weight memmap for UMAP.")
+                    except Exception as e:
+                        print(f"Warning: Failed to load italic weight memmap: {e}")
+                        return None
+                w = self._w_it_mmap
+            else:
+                w = w_it
+            dm = 1.0 - w.astype(np.float32, copy=False)
+
+        else:  # combined
+            # if caller supplied w_combined (deprecated), use it
+            if w_combined is not None:
+                dm = 1.0 - (w_combined.astype(np.float32)).astype(np.float32)
+            else:
+                # Need both memmaps, try lazy load if necessary
+                if getattr(self, '_w_rm_mmap', None) is None or getattr(self, '_w_it_mmap', None) is None:
+                    try:
+                        # Note: only load if available; if neither loadable, warn and skip
+                        if getattr(self, '_w_rm_mmap', None) is None:
+                            self._w_rm_mmap = np.load('./w_rm_matrix_ordered.npy', mmap_mode='r')
+                        if getattr(self, '_w_it_mmap', None) is None:
+                            self._w_it_mmap = np.load('./w_it_matrix_ordered.npy', mmap_mode='r')
+                        print("Loaded weight memmaps for combined UMAP computation.")
+                    except Exception as e:
+                        print(f"Warning: Failed to load weight memmaps for combined UMAP: {e}")
+                        return None
+
+                # Build a disk-backed memmap for the combined distance matrix in chunks to avoid high RAM
+                w_rm = self._w_rm_mmap
+                w_it = self._w_it_mmap
+                n = w_rm.shape[0]
+                combined_path = os.path.join(self._cache_dir, f'combined_for_umap_{font_type}_{n_neighbors}_{min_dist}.npy')
+                try:
+                    combined_memmap = np.lib.format.open_memmap(combined_path, mode='w+', dtype=np.float32, shape=(n, n))
+                    for i in range(n):
+                        row = (w_rm[i, :].astype(np.float32, copy=False) + w_it[i, :].astype(np.float32, copy=False)) * 0.5
+                        combined_memmap[i, :] = 1.0 - row
+                    dm = combined_memmap
+                except Exception as e:
+                    print(f"Warning: Failed to create combined memmap for UMAP: {e}")
+                    return None
+                finally:
+                    # ensure cleanup of memmap object; actual file removed after UMAP computed
+                    pass
+
+        # Compute UMAP positions
+        umap_positions = self._compute_umap_positions(dm, n_neighbors=n_neighbors, min_dist=min_dist)
+        if umap_positions is None:
+            print("UMAP computation failed or returned None.")
+            try:
+                if 'combined_memmap' in locals():
+                    del combined_memmap
+                # remove the combined_path file if present
+                if 'combined_path' in locals() and os.path.exists(combined_path):
+                    os.remove(combined_path)
+            except Exception:
+                pass
+            return None
+
+        # Save positions and cleanup combined memmap file (if any)
+        np.save(umap_file, umap_positions)
+        print(f"Saved UMAP positions to {umap_file}")
+        try:
+            if 'combined_memmap' in locals():
+                del combined_memmap
+            if 'combined_path' in locals() and os.path.exists(combined_path):
+                os.remove(combined_path)
+        except Exception:
+            pass
+
         print(f"UMAP positions shape: {umap_positions.shape}")
-        return umap_positions
+        return self._orient_umap_positions(umap_positions)
         
     def _create_heatmap(self):
         """Create similarity matrix heatmap matching notebook style"""     
@@ -175,14 +445,9 @@ class BookSimilarityDashboard:
         n_books = len(self.books)
         
         # Create the main heatmap
-        # Prepare customdata: for each cell, [impr_y, impr_x] (vectorized)
-        missing_mask = np.isin(self.impr_names, ['n. nan', 'm. missing'])
-        customdata = np.empty((n_books, n_books, 2), dtype=object)
-        # For rows (y): repeat for each column
-        customdata[:, :, 0] = np.where(missing_mask[:, None], '', self.impr_names[:, None])
-        # For columns (x): repeat for each row
-        customdata[:, :, 1] = customdata[:, :, 0] # Same as rows since square matrix
-
+        # To avoid creating a large object-typed customdata array (which causes many small Python allocations),
+        # we use a lightweight hovertemplate that shows only the book names and the shared types count.
+        # Printer information remains available via diagonal marker traces created separately.
 
         fig = go.Figure(data=go.Heatmap(
             z=n1hat,
@@ -190,11 +455,10 @@ class BookSimilarityDashboard:
             y=self.books,
             colorscale='viridis',  # Match notebook colormap
             reversescale=False,    # Don't reverse (notebook doesn't)
-            customdata=customdata,
             hoverongaps=False,
             hovertemplate=(
-                'Book 1: %{y} (%{customdata[0]})<br>'
-                'Book 2: %{x} (%{customdata[1]})<br>'
+                'Book 1: %{y}<br>'
+                'Book 2: %{x}<br>'
                 'Shared Types: %{z:.0f}<extra></extra>'
             ),
             showscale=False  # Hide colorbar to avoid legend overlap
@@ -254,6 +518,7 @@ class BookSimilarityDashboard:
                 borderwidth=0,
                 font=dict(size=9, family="Inter, Arial, sans-serif", color="#374151"),
                 itemclick="toggle",
+                itemdoubleclick="toggleothers",
                 tracegroupgap=1,
             )
         )
@@ -269,7 +534,7 @@ class BookSimilarityDashboard:
         with open(f'{self._cache_dir}/images_cache_meta.pkl', 'rb') as f:
             self.meta = pickle.load(f)
         self._all_letters = self.meta.get('all_letters', [])
-        print(f"  ✓ Loaded metadata from images_cache_meta.pkl ({len(self._all_letters)} letters)")
+        print(f"Loaded metadata from images_cache_meta.pkl ({len(self._all_letters)} letters)")
     
     def _hierarchical_order(self, distance_matrix):
         """Create hierarchical ordering of books"""
@@ -364,11 +629,22 @@ class BookSimilarityDashboard:
         Args:
             umap_positions: numpy array or list of UMAP coordinates (will be converted if needed)
         """
-        
+        # Ensure edges are precomputed (lazy load/compute)
+        try:
+            self._ensure_precomputed_edges(font_type, top_k=self.top_k, n_bins=self.n_bins)
+        except Exception as e:
+            print(f"Warning: Edge precomputation failed: {e}")
+
         # Use precomputed top edges
-        edges = self._top_edges[font_type]
-        # Use asarray to avoid copying if already an array
-        umap_positions = np.asarray(umap_positions, dtype=np.float32)
+        edges = self._top_edges.get(font_type, [])
+
+        # If umap_positions is None, compute a fallback using networkx spring layout from edges
+        if umap_positions is None:            
+            print(f"Warning: fallback layout failed ({e}), using zero positions")
+            umap_positions = np.zeros((len(self.books), 2), dtype=np.float32)
+        else:
+            # Use asarray to avoid copying if already an array
+            umap_positions = np.asarray(umap_positions, dtype=np.float32)
         
         if not edges:
             print(f"Warning: No edges found.")
@@ -502,6 +778,7 @@ class BookSimilarityDashboard:
                 borderwidth=1,
                 font=dict(size=11, family="Inter, Arial, sans-serif", color="#374151"),
                 itemclick="toggle",
+                itemdoubleclick="toggleothers",
                 tracegroupgap=1,
                 itemsizing="constant"
 
@@ -533,7 +810,25 @@ class BookSimilarityDashboard:
 
         
         return fig
-    
+
+    def _orient_umap_positions(self, umap_positions):
+        """Rotate (swap axes) so the axis with the larger range is placed on the x-axis.
+        This helps the network occupy more horizontal space in wide layouts.
+        """
+        umap_positions = np.asarray(umap_positions, dtype=np.float32)
+        # Guard for empty input or unexpected shapes
+        if umap_positions.size == 0 or umap_positions.ndim != 2 or umap_positions.shape[1] < 2:
+            return umap_positions
+        x_range = np.nanmax(umap_positions[:, 0]) - np.nanmin(umap_positions[:, 0])
+        y_range = np.nanmax(umap_positions[:, 1]) - np.nanmin(umap_positions[:, 1])
+        if y_range > x_range:
+            # Swap columns so the larger spread becomes x
+            rotated = umap_positions[:, [1, 0]].copy()
+            # Debug log (uncomment if needed)
+            # print("Rotated UMAP positions: swapped x/y to maximize horizontal spread")
+            return rotated
+        return umap_positions
+
     def _update_network_edges(self, current_fig, edge_opacity, umap_pos_array, font_type, selected_books=None):
         """Update edge traces in the network figure for new weight_matrix and threshold, keeping node traces.
         
@@ -541,6 +836,12 @@ class BookSimilarityDashboard:
             umap_pos_array: numpy array of UMAP positions (not list)
             selected_books: list of selected book names to recreate edges for (default None)
         """
+        # Ensure edges are computed/loaded for this font
+        try:
+            self._ensure_precomputed_edges(font_type, top_k=self.top_k, n_bins=self.n_bins)
+        except Exception as e:
+            print(f"Warning: _ensure_precomputed_edges failed: {e}")
+
         # Use binned edges for the font type
         bins = self._binned_edges.get(font_type, {})
         
@@ -703,13 +1004,14 @@ class BookSimilarityDashboard:
         return sorted(images, key=extract_number)
     
     
-    def _setup_layout(self, w_combined=None):
+    def _setup_layout(self, w_rm=None, w_it=None):
         """Setup the dashboard layout"""
         
-        # Load UMAP for store initialization (figures created on first callback for memory efficiency)
-        initial_umap = self._load_umap_positions(w_combined=w_combined / 2 if w_combined is not None else None)
+        # Load UMAP for store initialization (figures created on first callback for memory efficiency).
+        # Do NOT compute missing UMAP at startup; only load cached combined positions if present.
+        initial_umap = self._load_umap_positions(font_type='combined', w_rm=w_rm, w_it=w_it, n_neighbors=50, min_dist=0.5, compute_if_missing=False)
         initial_umap_list = initial_umap.tolist() if initial_umap is not None else None
-        print("✓ UMAP positions loaded, figures will be created on first render")
+        print("UMAP positions loaded (if cached), figures will be created on first render")
         
         # Create empty placeholder figures (actual figures created in callback to save memory)
         initial_network_fig = go.Figure()
@@ -797,6 +1099,12 @@ class BookSimilarityDashboard:
             
             # Store for selected books in network graph
             dcc.Store(id='network-selected-books-store', data=[]),
+            # Store to persist whether selected books traces are shown (True) or hidden ('legendonly'/False)
+            dcc.Store(id='network-selected-books-visibility-store', data=False),
+
+            # Persist legend visibility across updates (mapping trace name -> True or 'legendonly')
+            dcc.Store(id='network-legend-visibility-store', data={}),
+            dcc.Store(id='heatmap-legend-visibility-store', data={}),
             
             # Main content with letter comparison panel - styled container like network graph
             html.Div([
@@ -985,6 +1293,33 @@ class BookSimilarityDashboard:
                         "boxShadow": "0 1px 2px rgba(0,0,0,0.15)",
                     },
                 ),
+                # UMAP positioning source selector (Combined / Roman / Italic) - buttons placed on top of the network graph
+                html.Div([
+                    html.Div("Node positions source:", style={'fontSize': '13px',
+                                'fontWeight': '600',
+                                'color': '#887C57',
+                                'fontFamily': 'Inter, Arial, sans-serif'}),
+                    html.Button("Combined", id='umap-pos-combined-btn', n_clicks=0,
+                                style={'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                        'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                        'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+                    html.Button("Roman", id='umap-pos-roman-btn', n_clicks=0,
+                                style={'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                        'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                        'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+                    html.Button("Italic", id='umap-pos-italic-btn', n_clicks=0,
+                                style={'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                        'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                        'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+                    # Store to remember current UMAP position source (default 'combined')
+                    dcc.Store(id='umap-pos-source-store', data='combined')
+                ], style={'textAlign': 'center', 'marginBottom': '10px'}),
 
                 # Network graph controls row - 3 columns with fixed 30% width each
                 html.Div([
@@ -1300,60 +1635,300 @@ class BookSimilarityDashboard:
              State('edge-opacity-slider', 'value'),
              State('additional-books-dropdown', 'value'),
              State('node-size-slider', 'value'),
-             State('label-size-slider', 'value')],
+             State('label-size-slider', 'value'),
+             State('network-legend-visibility-store', 'data'),
+             State('heatmap-legend-visibility-store', 'data'),
+             State('network-selected-books-store', 'data'),
+             State('network-selected-books-visibility-store', 'data')],
             prevent_initial_call=False
         )
         def update_visualizations(font_type, umap_pos_array, current_network_fig, current_heatmap_fig, edge_opacity, 
-                                  selected_books, node_size, label_size):
-            # Handle None case for UMAP positions (load default if store not initialized)
-            store_update = dash.no_update
-            if umap_pos_array is None:
-                umap_pos_array = self._load_umap_positions()
+                                  selected_books, node_size, label_size, network_legend_vis, heatmap_legend_vis,
+                                  stored_selected_books, stored_selected_visibility):
+            try:
+                print(f"DEBUG: update_visualizations called - font_type={font_type}, umap_pos_array is None? {umap_pos_array is None}, last_font={self._last_font_type}")
+                ctx = dash.callback_context
+                print(f"DEBUG: ctx.triggered={ctx.triggered}")
+                # Handle None case for UMAP positions (load cached combined if available, but do not abort if missing)
+                store_update = dash.no_update
+                if umap_pos_array is None:
+                    umap_pos_array = self._load_umap_positions(font_type='combined', compute_if_missing=False)
+                    if umap_pos_array is not None:
+                        store_update = umap_pos_array.tolist()  # Update store with list for JSON
+                # Convert list to numpy array ONCE at start (from dcc.Store JSON) if available
+                # Use asarray (not array) to avoid copying if already an array
                 if umap_pos_array is not None:
-                    store_update = umap_pos_array.tolist()  # Update store with list for JSON
+                    umap_array = np.asarray(umap_pos_array, dtype=np.float32)
                 else:
-                    return dash.no_update, dash.no_update, dash.no_update
-            
-            # Convert list to numpy array ONCE at start (from dcc.Store JSON)
-            # Use asarray (not array) to avoid copying if already an array
-            umap_array = np.asarray(umap_pos_array, dtype=np.float32)
-            
-            # Select appropriate n1hat matrix
-            if font_type == 'roman':
-                n1hat_matrix = self.n1hat_rm
-            elif font_type == 'italic':
-                n1hat_matrix = self.n1hat_it
-            else:
-                n1hat_matrix = (self.n1hat_rm + self.n1hat_it) / 2
-            
-            # Check if figures are empty (initial state) or need full redraw
-            if not current_network_fig.get('data'):
-                # Full redraw - pass array directly
-                network_fig = self._create_network_graph(umap_array, edge_opacity or 1.0, font_type=font_type)
-            else:
-                # Minimal update: patch network edges - pass array directly
-                # This will also handle updating selected book edges with new font type
-                network_fig = self._update_network_edges(current_network_fig, edge_opacity or 1.0, umap_array, font_type, selected_books)
-            
-            if not current_heatmap_fig.get('data'):
-                # Full redraw
-                heatmap_fig = self._create_heatmap()
-            else:
-                # Minimal update: patch heatmap z/title and network edges
-                heatmap_fig = dash.Patch()
-                heatmap_fig['data'][0]['z'] = n1hat_matrix
+                    umap_array = None
                 
-                # Update customdata for marker traces
-                types_diag = np.diagonal(n1hat_matrix)
-                for i in range(1, len(current_heatmap_fig['data'])):
-                    trace = current_heatmap_fig['data'][i]
-                    impr = trace['name']
-                    mask = self.impr_names == impr  # boolean mask
-                    if np.any(mask):
-                        heatmap_fig['data'][i]['customdata'] = types_diag[mask][:, None]
-                        
-            return network_fig, heatmap_fig, store_update
-        
+                # Select appropriate n1hat matrix
+                if font_type == 'roman':
+                    n1hat_matrix = self.n1hat_rm
+                elif font_type == 'italic':
+                    n1hat_matrix = self.n1hat_it
+                else:
+                    n1hat_matrix = (self.n1hat_rm + self.n1hat_it) / 2
+
+                # If font_type changed, ensure edges are precomputed and force a full redraw
+                if font_type != self._last_font_type:
+                    try:
+                        self._ensure_precomputed_edges(font_type, top_k=self.top_k, n_bins=self.n_bins)
+                    except Exception as e:
+                        print(f"Warning: Could not ensure edges for font {font_type}: {e}")
+
+                    # Try to load per-font UMAP positions (cached only) and use them as layout when available.
+                    umap_for_font = self._load_umap_positions(font_type=font_type, compute_if_missing=False)
+                    if umap_for_font is not None:
+                        umap_array = np.asarray(umap_for_font, dtype=np.float32)
+                        store_update = umap_array.tolist()
+                        print(f"Loaded cached UMAP positions for font '{font_type}'")
+                    else:
+                        # Fall back to previously loaded UMAP (likely combined) and keep store_update as-is
+                        print(f"No cached UMAP found for font '{font_type}', using existing UMAP positions")
+
+                    # Full redraw ensures traces match the newly loaded binned edges
+                    network_fig = self._create_network_graph(umap_array, edge_opacity or 1.0, marker_size=node_size, label_size=label_size, font_type=font_type)
+                    # Apply persisted legend visibilities (if any)
+                    if network_legend_vis:
+                        nf = network_fig.to_plotly_json() if isinstance(network_fig, go.Figure) else network_fig
+                        for tr in nf.get('data', []):
+                            name = tr.get('name', '')
+                            if name in network_legend_vis:
+                                tr['visible'] = network_legend_vis[name]
+                        network_fig = nf
+                    # Restore selected-book overlays if the store indicates they should be shown
+                    try:
+                        if stored_selected_books and stored_selected_visibility and umap_array is not None:
+                            nf2 = network_fig if isinstance(network_fig, dict) else network_fig.to_plotly_json()
+                            umap_arr = np.asarray(umap_array, dtype=np.float32)
+                            book_list = list(self.books)
+                            for book in stored_selected_books:
+                                if book in book_list:
+                                    book_idx = book_list.index(book)
+                                    book_color = self._get_book_color(book)
+                                    printer_name = self.impr_names[book_idx] if book_idx < len(self.impr_names) else 'Unknown'
+                                    if printer_name in ['n. nan', 'm. missing']:
+                                        printer_name = 'Unknown'
+                                    nf2['data'].append({
+                                        'type': 'scatter',
+                                        'x': [umap_arr[book_idx, 0]],
+                                        'y': [umap_arr[book_idx, 1]],
+                                        'mode': 'markers+text',
+                                        'marker': {'symbol': 'star', 'size': node_size * 1.3 if node_size else 18, 'color': book_color, 'line': {'width': 2, 'color': 'white'}},
+                                        'text': [book], 'textposition': 'top center', 'textfont': {'size': label_size if label_size else 8, 'color': book_color, 'family': 'Arial, bold'},
+                                        'hovertemplate': f'{book}<br>Printer: {printer_name}<extra></extra>', 'name': f'selected_book_{book}', 'showlegend': False
+                                    })
+                            # Add selected edges
+                            bins = self._binned_edges.get(font_type, {})
+                            for book in stored_selected_books:
+                                if book in book_list:
+                                    book_idx = book_list.index(book)
+                                    book_color = self._get_book_color(book)
+                                    r = int(book_color[1:3], 16); g = int(book_color[3:5], 16); b = int(book_color[5:7], 16)
+                                    for bin_idx in range(10):
+                                        bin_data = bins.get(bin_idx, {'edges': [], 'avg_w': 0})
+                                        edges_in_bin = bin_data['edges']; avg_w = bin_data['avg_w']
+                                        if not edges_in_bin:
+                                            continue
+                                        edges_array = np.array(edges_in_bin)
+                                        mask = (edges_array[:, 0] == book_idx) | (edges_array[:, 1] == book_idx)
+                                        matching_edges = edges_array[mask]
+                                        if len(matching_edges) > 0:
+                                            edges_x = []; edges_y = []
+                                            for i, j in matching_edges:
+                                                edges_x.extend([umap_arr[i, 0], umap_arr[j, 0], None])
+                                                edges_y.extend([umap_arr[i, 1], umap_arr[j, 1], None])
+                                            opacity = min(1.0, avg_w)
+                                            color = f'rgba({r},{g},{b},{opacity})'
+                                            nf2['data'].append({'type': 'scatter', 'x': edges_x, 'y': edges_y, 'mode': 'lines', 'line': {'width': 2, 'color': color}, 'showlegend': False, 'customdata': [avg_w], 'name': f'selected_edge_{book}_bin{bin_idx}', 'hoverinfo': 'skip'})
+                            network_fig = nf2
+                    except Exception as e:
+                        print(f"Warning: restoring selected books on redraw failed: {e}")
+                    self._last_font_type = font_type
+                else:
+                    # Check if figures are empty (initial state) or need full redraw
+                    if not current_network_fig.get('data'):
+                        # Full redraw - pass array directly
+                        network_fig = self._create_network_graph(umap_array, edge_opacity or 1.0, marker_size=node_size, label_size=label_size, font_type=font_type)
+                        # Apply persisted legend visibilities (if any)
+                        if network_legend_vis:
+                            nf = network_fig.to_plotly_json() if isinstance(network_fig, go.Figure) else network_fig
+                            for tr in nf.get('data', []):
+                                name = tr.get('name', '')
+                                if name in network_legend_vis:
+                                    tr['visible'] = network_legend_vis[name]
+                            network_fig = nf
+                        # Restore selected-book overlays if the store indicates they should be shown
+                        try:
+                            if stored_selected_books and stored_selected_visibility and umap_array is not None:
+                                nf2 = network_fig if isinstance(network_fig, dict) else network_fig.to_plotly_json()
+                                umap_arr = np.asarray(umap_array, dtype=np.float32)
+                                book_list = list(self.books)
+                                for book in stored_selected_books:
+                                    if book in book_list:
+                                        book_idx = book_list.index(book)
+                                        book_color = self._get_book_color(book)
+                                        printer_name = self.impr_names[book_idx] if book_idx < len(self.impr_names) else 'Unknown'
+                                        if printer_name in ['n. nan', 'm. missing']:
+                                            printer_name = 'Unknown'
+                                        nf2['data'].append({
+                                            'type': 'scatter',
+                                            'x': [umap_arr[book_idx, 0]],
+                                            'y': [umap_arr[book_idx, 1]],
+                                            'mode': 'markers+text',
+                                            'marker': {'symbol': 'star', 'size': node_size * 1.3 if node_size else 18, 'color': book_color, 'line': {'width': 2, 'color': 'white'}},
+                                            'text': [book], 'textposition': 'top center', 'textfont': {'size': label_size if label_size else 8, 'color': book_color, 'family': 'Arial, bold'},
+                                            'hovertemplate': f'{book}<br>Printer: {printer_name}<extra></extra>', 'name': f'selected_book_{book}', 'showlegend': False
+                                        })
+                                # Add selected edges
+                                bins = self._binned_edges.get(font_type, {})
+                                for book in stored_selected_books:
+                                    if book in book_list:
+                                        book_idx = book_list.index(book)
+                                        book_color = self._get_book_color(book)
+                                        r = int(book_color[1:3], 16); g = int(book_color[3:5], 16); b = int(book_color[5:7], 16)
+                                        for bin_idx in range(10):
+                                            bin_data = bins.get(bin_idx, {'edges': [], 'avg_w': 0})
+                                            edges_in_bin = bin_data['edges']; avg_w = bin_data['avg_w']
+                                            if not edges_in_bin:
+                                                continue
+                                            edges_array = np.array(edges_in_bin)
+                                            mask = (edges_array[:, 0] == book_idx) | (edges_array[:, 1] == book_idx)
+                                            matching_edges = edges_array[mask]
+                                            if len(matching_edges) > 0:
+                                                edges_x = []; edges_y = []
+                                                for i, j in matching_edges:
+                                                    edges_x.extend([umap_arr[i, 0], umap_arr[j, 0], None])
+                                                    edges_y.extend([umap_arr[i, 1], umap_arr[j, 1], None])
+                                                opacity = min(1.0, avg_w)
+                                                color = f'rgba({r},{g},{b},{opacity})'
+                                                nf2['data'].append({'type': 'scatter', 'x': edges_x, 'y': edges_y, 'mode': 'lines', 'line': {'width': 2, 'color': color}, 'showlegend': False, 'customdata': [avg_w], 'name': f'selected_edge_{book}_bin{bin_idx}', 'hoverinfo': 'skip'})
+                                network_fig = nf2
+                        except Exception as e:
+                            print(f"Warning: restoring selected books on redraw failed: {e}")
+                    else:
+                        # Minimal update: patch network edges - pass array directly
+                        # This will also handle updating selected book edges with new font type
+                        network_fig = self._update_network_edges(current_network_fig, edge_opacity or 1.0, umap_array, font_type, selected_books)
+
+                if not current_heatmap_fig.get('data'):
+                    # Full redraw
+                    heatmap_fig = self._create_heatmap()
+                    # Apply persisted heatmap legend visibilities (if any)
+                    if heatmap_legend_vis:
+                        hf = heatmap_fig.to_plotly_json() if isinstance(heatmap_fig, go.Figure) else heatmap_fig
+                        for tr in hf.get('data', []):
+                            name = tr.get('name', '')
+                            if name in heatmap_legend_vis:
+                                tr['visible'] = heatmap_legend_vis[name]
+                        heatmap_fig = hf
+                else:
+                    # Minimal update: patch heatmap z/title and network edges
+                    heatmap_fig = dash.Patch()
+                    heatmap_fig['data'][0]['z'] = n1hat_matrix
+                    
+                    # Update customdata for marker traces
+                    types_diag = np.diagonal(n1hat_matrix)
+                    for i in range(1, len(current_heatmap_fig['data'])):
+                        trace = current_heatmap_fig['data'][i]
+                        impr = trace['name']
+                        mask = self.impr_names == impr  # boolean mask
+                        if np.any(mask):
+                            heatmap_fig['data'][i]['customdata'] = types_diag[mask][:, None]
+                            
+                print(f"DEBUG: update_visualizations returning network_fig type={type(network_fig)}, heatmap_fig type={type(heatmap_fig)}, store_update={'set' if store_update is not dash.no_update else 'no_update'}")
+                return network_fig, heatmap_fig, store_update
+            except Exception as e:
+                import traceback
+                print("ERROR in update_visualizations:", e)
+                print(traceback.format_exc())
+                return dash.no_update, dash.no_update, dash.no_update
+        # # Recalculate UMAP positions for selected font (computes and caches per-font UMAP)
+        # @self.app.callback(
+        #     [Output('umap-positions-store', 'data'), Output('network-graph', 'figure')],
+        #     [Input('recalculate-umap-btn', 'n_clicks')],
+        #     [State('umap-n-neighbors', 'value'), State('umap-min-dist', 'value'), State('umap-pos-source-store', 'data'),
+        #      State('edge-opacity-slider', 'value'), State('network-graph', 'figure'), State('node-size-slider', 'value'), State('label-size-slider', 'value'), State('font-type-store', 'data')],
+        #     prevent_initial_call=True
+        # )
+        # def recalc_umap(n_clicks, n_neighbors, min_dist, umap_pos_source, edge_opacity, current_network_fig, node_size, label_size, current_edge_font):
+        #     if not n_clicks:
+        #         return dash.no_update, dash.no_update
+        #     print(f"Recalculating UMAP for positions source '{umap_pos_source}' (n_neighbors={n_neighbors}, min_dist={min_dist})")
+        #     # Compute and cache UMAP positions for this positions source (may take time)
+        #     umap_positions = self._load_umap_positions(font_type=umap_pos_source, n_neighbors=n_neighbors, min_dist=min_dist, compute_if_missing=True)
+        #     if umap_positions is None:
+        #         print("UMAP recomputation failed or was aborted.")
+        #         return dash.no_update, dash.no_update
+        #     umap_array = np.asarray(umap_positions, dtype=np.float32)
+        #     # Ensure edges for current selected edge font exist so graph can be built
+        #     try:
+        #         self._ensure_precomputed_edges(current_edge_font, top_k=self.top_k, n_bins=self.n_bins)
+        #     except Exception as e:
+        #         print(f"Warning: Edge ensure failed during UMAP recalc: {e}")
+        #     # Recreate network graph using the *selected edge font* (edges unaffected by position source)
+        #     network_fig = self._create_network_graph(umap_array, edge_opacity or 1.0, marker_size=node_size, label_size=label_size, font_type=current_edge_font)
+        #     return umap_array.tolist(), network_fig
+
+        @self.app.callback(
+            [Output('umap-pos-source-store', 'data'), Output('umap-pos-combined-btn', 'style'), Output('umap-pos-roman-btn', 'style'), Output('umap-pos-italic-btn', 'style')],
+            [Input('umap-pos-combined-btn', 'n_clicks'), Input('umap-pos-roman-btn', 'n_clicks'), Input('umap-pos-italic-btn', 'n_clicks')],
+            [State('umap-pos-source-store', 'data')],
+            prevent_initial_call=True
+        )
+        def update_umap_pos_source(combined_clicks, roman_clicks, italic_clicks, current_source):
+            ctx = dash.callback_context
+            if not ctx.triggered:
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+            active = {'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                        'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                        'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}
+            inactive = {'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                        'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                        'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px', 'minWidth': '100px'}
+            if trigger_id == 'umap-pos-combined-btn':
+                return 'combined', active, inactive, inactive
+            elif trigger_id == 'umap-pos-roman-btn':
+                return 'roman', inactive, active, inactive
+            elif trigger_id == 'umap-pos-italic-btn':
+                return 'italic', inactive, inactive, active
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+        @self.app.callback(
+            [Output('umap-positions-store', 'data', allow_duplicate=True),
+            Output('network-graph', 'figure', allow_duplicate=True)],
+            [Input('umap-pos-source-store', 'data')],
+            [State('network-graph', 'figure'), State('edge-opacity-slider', 'value'),
+            State('node-size-slider', 'value'), State('label-size-slider', 'value'),
+            State('font-type-store', 'data'), State('network-legend-visibility-store', 'data')],
+            prevent_initial_call=True
+        )
+        def handle_umap_pos_source_change(pos_source, current_network_fig, edge_opacity, node_size, label_size, current_edge_font, network_legend_vis):
+            # Try to load cached UMAP positions for selected source; do not compute automatically
+            umap_positions = self._load_umap_positions(font_type=pos_source, compute_if_missing=True)
+            if umap_positions is None:
+                print(f"No cached UMAP positions for source '{pos_source}', computation deferred. Use Recalculate to compute.")
+                return dash.no_update, dash.no_update
+            umap_array = np.asarray(umap_positions, dtype=np.float32)
+            # Recreate network using existing edge font selection (edges unaffected by position source)
+            network_fig = self._create_network_graph(umap_array, edge_opacity or 1.0, marker_size=node_size, label_size=label_size, font_type=current_edge_font)
+            # Apply persisted visibilities if present
+            if network_legend_vis:
+                nf = network_fig.to_plotly_json() if isinstance(network_fig, go.Figure) else network_fig
+                for tr in nf.get('data', []):
+                    name = tr.get('name', '')
+                    if name in network_legend_vis:
+                        tr['visible'] = network_legend_vis[name]
+                network_fig = nf
+            print(f"DEBUG: handle_umap_pos_source_change returning network_fig type={type(network_fig)}")
+            return umap_array.tolist(), network_fig     
+           
         # Initialize letter filter and printer dropdown on load
         @self.app.callback(
             [Output('letter-filter', 'options'),
@@ -1416,8 +1991,8 @@ class BookSimilarityDashboard:
         
         # Store clicked books from matrix and handle clear button
         @self.app.callback(
-            [Output('clicked-books-store', 'data'),
-             Output('additional-books-dropdown', 'value')],
+            [Output('clicked-books-store', 'data', allow_duplicate=True),
+             Output('additional-books-dropdown', 'value', allow_duplicate=True)],
             [Input('similarity-heatmap', 'clickData'),
              Input('clear-comparison-btn', 'n_clicks')],
             [State('clicked-books-store', 'data'),
@@ -1665,12 +2240,14 @@ class BookSimilarityDashboard:
             prevent_initial_call=True
         )
         def handle_network_click(click_data, stored_books, dropdown_books):
+            """Toggle a book in the selected-books list when a node is clicked.
+            If the clicked book is already selected, remove it; otherwise add it."""
             if click_data is None:
                 return dash.no_update, dash.no_update
-            
+
             # Get the clicked point's custom data (contains book name)
             point = click_data['points'][0]
-            
+
             # customdata contains "book_name<br>Printer: ..." - extract book name
             if 'customdata' in point:
                 custom = point['customdata']
@@ -1679,12 +2256,17 @@ class BookSimilarityDashboard:
             else:
                 # Fallback: might be clicking on edge, ignore
                 return dash.no_update, dash.no_update
-            
-            # Add book to existing selection
+
+            # Toggle book in existing selection
             current_books = list(dropdown_books) if dropdown_books else []
-            if book_name not in current_books:
+            if book_name in current_books:
+                # If already selected, remove it
+                current_books = [b for b in current_books if b != book_name]
+            else:
+                # Otherwise add it
                 current_books.append(book_name)
-            
+
+            # Update both the clicked-books store and the dropdown value
             return current_books, current_books
                 
         # Separate callback for edge opacity - uses Patch for instant updates
@@ -1754,8 +2336,9 @@ class BookSimilarityDashboard:
         # Show/hide all printers in network graph legend
         @self.app.callback(
             [Output('network-graph', 'figure', allow_duplicate=True),
-             Output('show-all-network-printers-btn', 'style'),
-             Output('hide-all-network-printers-btn', 'style')],
+             Output('show-all-network-printers-btn', 'style', allow_duplicate=True),
+             Output('hide-all-network-printers-btn', 'style', allow_duplicate=True),
+             Output('network-legend-visibility-store', 'data', allow_duplicate=True)],
             [Input('show-all-network-printers-btn', 'n_clicks'),
              Input('hide-all-network-printers-btn', 'n_clicks')],
             [State('network-graph', 'figure')],
@@ -1764,7 +2347,7 @@ class BookSimilarityDashboard:
         def toggle_all_network_printers(show_clicks, hide_clicks, current_fig):
             ctx = dash.callback_context
             if not ctx.triggered:
-                return dash.no_update, dash.no_update, dash.no_update
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
             
             trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
             show_all = trigger_id == 'show-all-network-printers-btn'
@@ -1777,7 +2360,7 @@ class BookSimilarityDashboard:
             hide_style = active_style_mr if not show_all else inactive_style_mr
             
             if not current_fig.get('data'):
-                return dash.no_update, show_style, hide_style
+                return dash.no_update, show_style, hide_style, dash.no_update
             
             # Use dash.Patch for efficient update
             patched_fig = dash.Patch()
@@ -1788,17 +2371,140 @@ class BookSimilarityDashboard:
                     # Skip edge traces (named bin_0, bin_1, etc.) and selected book traces
                     if trace.get('name', '').startswith('bin_') or trace.get('name', '').startswith('selected_'):
                         continue
-                    # Use opacity instead of visible to preserve layout
-                    patched_fig['data'][i]['opacity'] = 1.0 if show_all else 0.0
-            
-            return patched_fig, show_style, hide_style
-        
+                    # Use 'visible' so legend interactions still work (legendonly / True)
+                    patched_fig['data'][i]['visible'] = True if show_all else 'legendonly'
+
+            # Build visibility mapping for network legend store
+            store_update = {}
+            for i, trace in enumerate(current_fig.get('data', [])):
+                if trace.get('name', '').startswith('bin_') or trace.get('name', '').startswith('selected_'):
+                    continue
+                name = trace.get('name', '')
+                store_update[name] = True if show_all else 'legendonly'
+
+            return patched_fig, show_style, hide_style, store_update
+
+        # Update network legend visibility store when user toggles legend items in the network graph
+        @self.app.callback(
+            Output('network-legend-visibility-store', 'data', allow_duplicate=True),
+            [Input('network-graph', 'restyleData')],
+            [State('network-graph', 'figure'), State('network-legend-visibility-store', 'data')],
+            prevent_initial_call=True
+        )
+        def sync_network_legend_visibility(restyleData, current_fig, store):
+            if restyleData is None:
+                return dash.no_update
+            try:
+                changes = restyleData[0]
+                idxs = restyleData[1] if len(restyleData) > 1 else None
+                new_store = dict(store) if store else {}
+                if 'visible' in changes:
+                    vals = changes['visible']
+                    if idxs:
+                        for i, idx in enumerate(idxs):
+                            val = vals[i] if isinstance(vals, list) and len(vals) > i else vals[0]
+                            name = current_fig['data'][idx].get('name', '')
+                            new_store[name] = val
+                    else:
+                        arr = vals[0] if isinstance(vals, list) and len(vals) == 1 and isinstance(vals[0], list) else vals
+                        for idx, tr in enumerate(current_fig.get('data', [])):
+                            name = tr.get('name', '')
+                            if idx < len(arr):
+                                new_store[name] = arr[idx]
+                return new_store
+            except Exception as e:
+                print(f"Warning: sync_network_legend_visibility failed: {e}")
+                return dash.no_update
+
+        # Update heatmap legend visibility store when user toggles legend items in the heatmap
+        @self.app.callback(
+            Output('heatmap-legend-visibility-store', 'data', allow_duplicate=True),
+            [Input('similarity-heatmap', 'restyleData')],
+            [State('similarity-heatmap', 'figure'), State('heatmap-legend-visibility-store', 'data')],
+            prevent_initial_call=True
+        )
+        def sync_heatmap_legend_visibility(restyleData, current_fig, store):
+            if restyleData is None:
+                return dash.no_update
+            try:
+                changes = restyleData[0]
+                idxs = restyleData[1] if len(restyleData) > 1 else None
+                new_store = dict(store) if store else {}
+                if 'visible' in changes:
+                    vals = changes['visible']
+                    if idxs:
+                        for i, idx in enumerate(idxs):
+                            val = vals[i] if isinstance(vals, list) and len(vals) > i else vals[0]
+                            name = current_fig['data'][idx].get('name', '')
+                            new_store[name] = val
+                    else:
+                        arr = vals[0] if isinstance(vals, list) and len(vals) == 1 and isinstance(vals[0], list) else vals
+                        for idx, tr in enumerate(current_fig.get('data', [])):
+                            name = tr.get('name', '')
+                            if idx < len(arr):
+                                new_store[name] = arr[idx]
+                return new_store
+            except Exception as e:
+                print(f"Warning: sync_heatmap_legend_visibility failed: {e}")
+                return dash.no_update
+
+        # Keep heatmap show/hide button styles in sync with legend visibility store
+        @self.app.callback(
+            [Output('show-all-printers-btn', 'style'), Output('hide-all-printers-btn', 'style')],
+            [Input('heatmap-legend-visibility-store', 'data')],
+            prevent_initial_call=False
+        )
+        def sync_heatmap_printer_buttons(store):
+            # Recreate the active/inactive style dicts to match layout
+            active_style = {'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                           'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                           'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                           'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                           'width': '130px', 'minWidth': '130px'}
+            inactive_style = {'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                             'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                             'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '130px', 'minWidth': '130px'}
+            if not store:
+                return dash.no_update, dash.no_update
+            vals = list(store.values())
+            # Determine if all visible, all hidden, or mixed
+            all_visible = all(v is True for v in vals)
+            all_hidden = all(v == 'legendonly' for v in vals)
+            if all_visible:
+                return active_style, inactive_style
+            if all_hidden:
+                return inactive_style, active_style
+            return inactive_style, inactive_style
+
+        # Keep network show/hide printer button styles in sync with legend visibility store
+        @self.app.callback(
+            [Output('show-all-network-printers-btn', 'style'), Output('hide-all-network-printers-btn', 'style')],
+            [Input('network-legend-visibility-store', 'data')],
+            prevent_initial_call=False
+        )
+        def sync_network_printer_buttons(store):
+            active_style = { 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500', 'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white','border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '120px', 'minWidth': '120px'}
+            active_style_mr = {**active_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            inactive_style = { 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500', 'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040','border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '120px', 'minWidth': '120px'}
+            inactive_style_mr = {**inactive_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            if not store:
+                return dash.no_update, dash.no_update
+            vals = list(store.values())
+            all_visible = all(v is True for v in vals)
+            all_hidden = all(v == 'legendonly' for v in vals)
+            if all_visible:
+                return active_style, inactive_style
+            if all_hidden:
+                return inactive_style_mr, active_style_mr
+            return inactive_style, inactive_style_mr
+
         # Sync selected books from dropdown to network graph and handle show/hide
         @self.app.callback(
             [Output('network-graph', 'figure', allow_duplicate=True),
              Output('network-selected-books-store', 'data'),
              Output('show-selected-books-btn', 'style'),
-             Output('hide-selected-books-btn', 'style')],
+             Output('hide-selected-books-btn', 'style'),
+             Output('network-selected-books-visibility-store', 'data')],
             [Input('additional-books-dropdown', 'value'),
              Input('show-selected-books-btn', 'n_clicks'),
              Input('hide-selected-books-btn', 'n_clicks')],
@@ -1810,18 +2516,19 @@ class BookSimilarityDashboard:
              State('font-type-store', 'data'),
              State('edge-opacity-slider', 'value'),
              State('show-selected-books-btn', 'style'),
-             State('hide-selected-books-btn', 'style')],
+             State('hide-selected-books-btn', 'style'),
+             State('network-selected-books-visibility-store', 'data')],
             prevent_initial_call=True
         )
         def handle_selected_books_in_network(selected_books, show_clicks, hide_clicks, current_fig, 
                                               stored_books, umap_positions, node_size, label_size, font_type, edge_opacity,
-                                              show_btn_style, hide_btn_style):
+                                              show_btn_style, hide_btn_style, stored_visibility):
             if current_fig is None or not current_fig.get('data'):
-                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
             
             ctx = dash.callback_context
             if not ctx.triggered:
-                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
             
             trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
             
@@ -1969,21 +2676,24 @@ class BookSimilarityDashboard:
             # Don't update button styles when dropdown changes (clicking nodes)
             if trigger_id == 'additional-books-dropdown':
                 # Return no_update for button styles to preserve current state
-                return patched_fig, selected_books, dash.no_update, dash.no_update
+                return patched_fig, selected_books, dash.no_update, dash.no_update, stored_visibility
             elif should_show:
                 show_sel_style = active_style
                 hide_sel_style = inactive_style_mr
+                store_update = True
             else:
                 show_sel_style = inactive_style
                 hide_sel_style = active_style_mr
+                store_update = False
             
-            return patched_fig, selected_books, show_sel_style, hide_sel_style
+            return patched_fig, selected_books, show_sel_style, hide_sel_style, store_update
         
         # Toggle heatmap printer visibility
         @self.app.callback(
             [Output('similarity-heatmap', 'figure', allow_duplicate=True),
-             Output('show-all-printers-btn', 'style'),
-             Output('hide-all-printers-btn', 'style')],
+             Output('show-all-printers-btn', 'style', allow_duplicate=True),
+             Output('hide-all-printers-btn', 'style', allow_duplicate=True),
+             Output('heatmap-legend-visibility-store', 'data', allow_duplicate=True)],
             [Input('show-all-printers-btn', 'n_clicks'),
             Input('hide-all-printers-btn', 'n_clicks')],
             [State('similarity-heatmap', 'figure')],
@@ -2003,11 +2713,11 @@ class BookSimilarityDashboard:
                              'width': '130px', 'minWidth': '130px'}
             
             if current_fig is None:
-                return dash.no_update, dash.no_update, dash.no_update
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
             ctx = dash.callback_context
             if not ctx.triggered:
-                return dash.no_update, dash.no_update, dash.no_update
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
             trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
             show_all = trigger_id == 'show-all-printers-btn'
@@ -2017,8 +2727,8 @@ class BookSimilarityDashboard:
                 # Skip overlay traces (they should always be visible)
                 if current_fig['data'][i].get('name', '').startswith('overlay_'):
                     continue
-                # Use opacity instead of visible to preserve layout
-                patched_fig['data'][i]['opacity'] = 1.0 if show_all else 0.0
+                # Use 'visible' so legend interactions still work (legendonly / True)
+                patched_fig['data'][i]['visible'] = True if show_all else 'legendonly'
 
             # Preserve layout settings
             patched_fig['layout']['uirevision'] = 'constant'
@@ -2033,7 +2743,15 @@ class BookSimilarityDashboard:
                 show_style = inactive_style
                 hide_style = active_style
 
-            return patched_fig, show_style, hide_style
+            # Build visibility mapping for heatmap legend store
+            store_update = {}
+            for i in range(1, len(current_fig['data'])):
+                if current_fig['data'][i].get('name', '').startswith('overlay_'):
+                    continue
+                name = current_fig['data'][i].get('name', '')
+                store_update[name] = True if show_all else 'legendonly'
+
+            return patched_fig, show_style, hide_style, store_update
         
         # Dynamically adjust tick font size based on zoom level
         @self.app.callback(
@@ -2358,7 +3076,12 @@ class BookSimilarityDashboard:
                     html.P(f"Font type: {font_type}", 
                            style={'textAlign': 'center', 'color': 'gray', 'fontSize': '10px'})
                 ])
-    
+        
+        # Debug: confirm callback setup finished
+        try:
+            print(f"DEBUG: _setup_callbacks completed - {len(self.app.callback_map)} callbacks registered; keys sample: {list(self.app.callback_map.keys())[:8]}")
+        except Exception as e:
+            print("DEBUG: _setup_callbacks completed - callback_map inspect failed:", e)
     
     def _encode_image(self, image_path):
         """Load image directly from disk without caching"""
@@ -2382,6 +3105,10 @@ class BookSimilarityDashboard:
             dashboard.run_server(host='0.0.0.0', port=8050)
             Then share your IP address: http://<your-ip>:8050
         """
+        try:
+            print(f"DEBUG: Starting server on {host}:{port} with {len(self.app.callback_map)} callbacks registered")
+        except Exception as e:
+            print("DEBUG: Starting server (callback_map inspect failed):", e)
         self.app.run_server(debug=debug, port=port, host=host)
 
 
