@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+.vscode/
+static_site/
+*.log
+*.cache
+.DS_Store
+scripts/
+profiles/
+.dockerignore
+Dockerfile

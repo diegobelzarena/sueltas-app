@@ -3,9 +3,7 @@ Dashboard Launcher for Book Similarity Analysis
 This script integrates with your acontrario.ipynb notebook data
 """
 
-import sys
 import os
-import numpy as np
 import pickle
 from datetime import datetime
 from book_similarity_dashboard import BookSimilarityDashboard

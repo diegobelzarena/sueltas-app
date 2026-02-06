@@ -1,28 +1,16 @@
 import dash
 from dash import dcc, html, callback, Input, Output, State
 import plotly.graph_objects as go
-import plotly.express as px
-import pandas as pd
 import numpy as np
-import networkx as nx
-from scipy.cluster.hierarchy import linkage, optimal_leaf_ordering, leaves_list
 import json
 import base64
 import os
 import glob
 import pickle
 from datetime import datetime
-import time
 import threading
-import uuid
 import tempfile
-
-try:
-    import umap
-    UMAP_AVAILABLE = True
-except ImportError:
-    UMAP_AVAILABLE = False
-    print("Warning: UMAP not installed. Install with 'pip install umap-learn' for UMAP layouts.")
+from flask import send_from_directory, abort
 
 class BookSimilarityDashboard:
     # Cache size limits for memory optimization
@@ -57,6 +45,8 @@ class BookSimilarityDashboard:
 
         self.app = dash.Dash(__name__, suppress_callback_exceptions=True)
         self.app.layout = html.Div("Loading data, please wait…")
+        # Register route to serve pre-extracted images from the images_cache folder
+        self._register_image_route()
         
     def set_data(self):
         """
@@ -342,101 +332,28 @@ class BookSimilarityDashboard:
         if not compute_if_missing:
             print(f"UMAP file {umap_file} missing — computation deferred until requested.")
             return None
+        
+        return None
 
-        print("Computing UMAP positions...")
-        # Determine which weight sources to use depending on font_type
-        # If required memmaps are not provided, try lazy-loading from self
-        if font_type == 'roman':
-            if w_rm is None:
-                if getattr(self, '_w_rm_mmap', None) is None:
-                    try:
-                        self._w_rm_mmap = np.load('./w_rm_matrix_ordered.npy', mmap_mode='r')
-                        print("Loaded roman weight memmap for UMAP.")
-                    except Exception as e:
-                        print(f"Warning: Failed to load roman weight memmap: {e}")
-                        return None
-                w = self._w_rm_mmap
-            else:
-                w = w_rm
-            dm = 1.0 - w.astype(np.float32, copy=False)
+    def _register_image_route(self):
+        """Register a Flask route to serve images from the images_cache directory.
 
-        elif font_type == 'italic':
-            if w_it is None:
-                if getattr(self, '_w_it_mmap', None) is None:
-                    try:
-                        self._w_it_mmap = np.load('./w_it_matrix_ordered.npy', mmap_mode='r')
-                        print("Loaded italic weight memmap for UMAP.")
-                    except Exception as e:
-                        print(f"Warning: Failed to load italic weight memmap: {e}")
-                        return None
-                w = self._w_it_mmap
-            else:
-                w = w_it
-            dm = 1.0 - w.astype(np.float32, copy=False)
-
-        else:  # combined
-            # if caller supplied w_combined (deprecated), use it
-            if w_combined is not None:
-                dm = 1.0 - (w_combined.astype(np.float32)).astype(np.float32)
-            else:
-                # Need both memmaps, try lazy load if necessary
-                if getattr(self, '_w_rm_mmap', None) is None or getattr(self, '_w_it_mmap', None) is None:
-                    try:
-                        # Note: only load if available; if neither loadable, warn and skip
-                        if getattr(self, '_w_rm_mmap', None) is None:
-                            self._w_rm_mmap = np.load('./w_rm_matrix_ordered.npy', mmap_mode='r')
-                        if getattr(self, '_w_it_mmap', None) is None:
-                            self._w_it_mmap = np.load('./w_it_matrix_ordered.npy', mmap_mode='r')
-                        print("Loaded weight memmaps for combined UMAP computation.")
-                    except Exception as e:
-                        print(f"Warning: Failed to load weight memmaps for combined UMAP: {e}")
-                        return None
-
-                # Build a disk-backed memmap for the combined distance matrix in chunks to avoid high RAM
-                w_rm = self._w_rm_mmap
-                w_it = self._w_it_mmap
-                n = w_rm.shape[0]
-                combined_path = os.path.join(self._cache_dir, f'combined_for_umap_{font_type}_{n_neighbors}_{min_dist}.npy')
-                try:
-                    combined_memmap = np.lib.format.open_memmap(combined_path, mode='w+', dtype=np.float32, shape=(n, n))
-                    for i in range(n):
-                        row = (w_rm[i, :].astype(np.float32, copy=False) + w_it[i, :].astype(np.float32, copy=False)) * 0.5
-                        combined_memmap[i, :] = 1.0 - row
-                    dm = combined_memmap
-                except Exception as e:
-                    print(f"Warning: Failed to create combined memmap for UMAP: {e}")
-                    return None
-                finally:
-                    # ensure cleanup of memmap object; actual file removed after UMAP computed
-                    pass
-
-        # Compute UMAP positions
-        umap_positions = self._compute_umap_positions(dm, n_neighbors=n_neighbors, min_dist=min_dist)
-        if umap_positions is None:
-            print("UMAP computation failed or returned None.")
-            try:
-                if 'combined_memmap' in locals():
-                    del combined_memmap
-                # remove the combined_path file if present
-                if 'combined_path' in locals() and os.path.exists(combined_path):
-                    os.remove(combined_path)
-            except Exception:
-                pass
-            return None
-
-        # Save positions and cleanup combined memmap file (if any)
-        np.save(umap_file, umap_positions)
-        print(f"Saved UMAP positions to {umap_file}")
+        The route will serve files at /images_cache/<book>/<filename>, where the
+        files are read from self._cache_dir.
+        """
         try:
-            if 'combined_memmap' in locals():
-                del combined_memmap
-            if 'combined_path' in locals() and os.path.exists(combined_path):
-                os.remove(combined_path)
-        except Exception:
-            pass
+            cache_dir_abs = os.path.abspath(self._cache_dir)
 
-        print(f"UMAP positions shape: {umap_positions.shape}")
-        return self._orient_umap_positions(umap_positions)
+            @self.app.server.route('/images_cache/<path:filename>')
+            def _serve_image(filename):
+                # Security: ensure the requested file is inside the cache dir
+                target = os.path.abspath(os.path.join(cache_dir_abs, filename))
+                if not target.startswith(cache_dir_abs):
+                    abort(404)
+                # send_from_directory will set appropriate headers
+                return send_from_directory(cache_dir_abs, filename)
+        except Exception as e:
+            print(f"Warning: Could not register image route: {e}")
         
     def _create_heatmap(self):
         """Create similarity matrix heatmap matching notebook style"""     
@@ -535,58 +452,30 @@ class BookSimilarityDashboard:
             self.meta = pickle.load(f)
         self._all_letters = self.meta.get('all_letters', [])
         print(f"Loaded metadata from images_cache_meta.pkl ({len(self._all_letters)} letters)")
-    
-    def _hierarchical_order(self, distance_matrix):
-        """Create hierarchical ordering of books"""
-        try:
-            # Convert to condensed distance matrix for scipy
-            mask = np.triu(np.ones_like(distance_matrix, dtype=bool), k=1)
-            condensed = distance_matrix[mask]
-            
-            # Handle edge cases
-            if len(condensed) == 0 or np.all(np.isnan(condensed)) or np.all(np.isinf(condensed)):
-                return np.arange(len(distance_matrix))
-            
-            # Replace inf/nan with max finite value + 1
-            max_finite = np.max(condensed[np.isfinite(condensed)]) if np.any(np.isfinite(condensed)) else 1.0
-            condensed = np.where(np.isfinite(condensed), condensed, max_finite + 1)
-            
-            # Perform linkage and optimal leaf ordering
-            linkage_matrix = linkage(condensed, method='average')
-            optimal_order = optimal_leaf_ordering(linkage_matrix, condensed)
-            
-            # optimal_leaf_ordering returns the linkage matrix with optimal leaf ordering
-            # We need to extract the leaf order from this
-            from scipy.cluster.hierarchy import leaves_list
-            leaf_order = leaves_list(optimal_order)
-            
-            return leaf_order
-        except Exception as e:
-            print(f"Warning: Hierarchical ordering failed ({e}), using default order")
-            return np.arange(len(distance_matrix))
+
 
     
-    def _compute_umap_positions(self, distance_matrix, n_neighbors=50, min_dist=0.5, random_state=42):
-        """Compute UMAP positions from distance matrix"""
-        if not UMAP_AVAILABLE:
-            print("UMAP not available, falling back to spring layout")
-            return None
+    # def _compute_umap_positions(self, distance_matrix, n_neighbors=50, min_dist=0.5, random_state=42):
+    #     """Compute UMAP positions from distance matrix"""
+    #     if not UMAP_AVAILABLE:
+    #         print("UMAP not available, falling back to spring layout")
+    #         return None
         
-        try:
-            reducer = umap.UMAP(
-                metric='precomputed',
-                n_neighbors=n_neighbors,
-                min_dist=min_dist,
-                n_components=2,
-                random_state=random_state,
-            )
-            # UMAP expects float32 input for best performance/compatibility
-            dm = distance_matrix.astype(np.float32, copy=False)
-            positions = reducer.fit_transform(dm)
-            return positions
-        except Exception as e:
-            print(f"UMAP failed: {e}, falling back to spring layout")
-            return None
+    #     try:
+    #         reducer = umap.UMAP(
+    #             metric='precomputed',
+    #             n_neighbors=n_neighbors,
+    #             min_dist=min_dist,
+    #             n_components=2,
+    #             random_state=random_state,
+    #         )
+    #         # UMAP expects float32 input for best performance/compatibility
+    #         dm = distance_matrix.astype(np.float32, copy=False)
+    #         positions = reducer.fit_transform(dm)
+    #         return positions
+    #     except Exception as e:
+    #         print(f"UMAP failed: {e}, falling back to spring layout")
+    #         return None
     
     def _get_printer_colors(self):
         """Get color mapping for printers - matching heatmap colors/markers"""
@@ -966,42 +855,96 @@ class BookSimilarityDashboard:
         return sorted(list(letters))
     
     def _get_available_images(self, book_name, letter, font_type='roman'):
-        """Get available encoded images for a specific book, letter, and font type from the per-book pickle cache."""
-        
-        # Determine which font types to search for
+        """Get available images for a specific book and letter.
+
+        Behavior (streamlined):
+          - Assumes only WebP files on disk (no PNG/JPG fallback).
+          - Does NOT fall back to per-book pickle data — returns [] if no files found.
+          - Efficiently scans the book directory once and enforces strict font+case matching.
+        """
+        book_dir = os.path.join(self._cache_dir, book_name)
+        if not os.path.isdir(book_dir):
+            return []
+
+        # Only consider .webp files (case-insensitive extension check)
+        try:
+            files = [f for f in os.listdir(book_dir) if f.lower().endswith('.webp')]
+        except Exception:
+            return []
+
+        if not files:
+            return []
+
+        # Determine font types to consider
         if font_type == 'combined':
             font_types_to_search = ['roman', 'italic']
         else:
             font_types_to_search = [font_type]
 
-        book_pkl = os.path.join(self._cache_dir, f"images_{book_name}.pkl")
-        if not os.path.exists(book_pkl):
-            print(f"Warning: Cache file not found for book {book_name}: {book_pkl}")
-            return []
+        # First, prefer font-prefixed files like 'italic_upper-A_1.webp' / 'roman_lower-a_0.webp'
+        prefixed_candidates = [f for f in files if any(f.startswith(f"{ft}_") for ft in font_types_to_search)]
+        selected = []
 
-        try:
-            with open(book_pkl, 'rb') as f:
-                book_data = pickle.load(f)
-        except Exception as e:
-            print(f"Warning: Failed to load cache for {book_name}: {e}")
-            return []
-
-        images = []
-        for ft in font_types_to_search:
-            key = (ft, letter)
-            if key in book_data:
-                images.extend(book_data[key])  # Each entry is (img_path, encoded)
-
-        # Optionally sort by image path number if needed
-        def extract_number(item):
-            path = item[0]
-            filename = os.path.basename(path)
+        def _matches_case_and_letter_after(prefix, fn, expected_letter):
+            # prefix is like 'italic_upper-' or 'roman_lower-'
             try:
-                return int(filename.split('_')[-1].split('.')[0])
-            except ValueError:
+                ch = fn[len(prefix)]
+            except Exception:
+                return False
+            if prefix.endswith('upper-'):
+                return ch == expected_letter and expected_letter.isupper()
+            else:
+                return ch == expected_letter and expected_letter.islower()
+
+        if prefixed_candidates:
+            for fn in prefixed_candidates:
+                for ft in font_types_to_search:
+                    up_pref = f"{ft}_upper-"
+                    low_pref = f"{ft}_lower-"
+                    if fn.startswith(up_pref) and _matches_case_and_letter_after(up_pref, fn, letter):
+                        selected.append(fn)
+                        break
+                    if fn.startswith(low_pref) and _matches_case_and_letter_after(low_pref, fn, letter):
+                        selected.append(fn)
+                        break
+        else:
+            # No font-prefixed files found: accept legacy naming conventions or unprefixed files
+            for fn in files:
+                if fn.startswith('upper-'):
+                    try:
+                        ch = fn.split('-', 1)[1][0]
+                    except Exception:
+                        continue
+                    if ch == letter and letter.isupper():
+                        selected.append(fn)
+                elif fn.startswith('lower-'):
+                    try:
+                        ch = fn.split('-', 1)[1][0]
+                    except Exception:
+                        continue
+                    if ch == letter and letter.islower():
+                        selected.append(fn)
+                else:
+                    # Unprefixed names, e.g., 'A_0.webp' or 'a_1.webp'
+                    if fn and fn[0] == letter:
+                        selected.append(fn)
+
+        # Sort by trailing numeric suffix if present (stable fallback to filename order)
+        def _extract_num_from_name(fn):
+            stem = fn.rsplit('.', 1)[0]
+            try:
+                return int(stem.split('_')[-1])
+            except Exception:
                 return 0
 
-        return sorted(images, key=extract_number)
+        selected = sorted(selected, key=_extract_num_from_name)
+        results = []
+        for fname in selected:
+            p = os.path.join(book_dir, fname)
+            url = f"/images_cache/{book_name}/{fname}"
+            results.append((p, url))
+        return results
+            
     
     
     def _setup_layout(self, w_rm=None, w_it=None):
@@ -1911,7 +1854,7 @@ class BookSimilarityDashboard:
         )
         def handle_umap_pos_source_change(pos_source, current_network_fig, edge_opacity, node_size, label_size, current_edge_font, network_legend_vis):
             # Try to load cached UMAP positions for selected source; do not compute automatically
-            umap_positions = self._load_umap_positions(font_type=pos_source, compute_if_missing=True)
+            umap_positions = self._load_umap_positions(font_type=pos_source, compute_if_missing=False)
             if umap_positions is None:
                 print(f"No cached UMAP positions for source '{pos_source}', computation deferred. Use Recalculate to compute.")
                 return dash.no_update, dash.no_update
@@ -1934,15 +1877,25 @@ class BookSimilarityDashboard:
             [Output('letter-filter', 'options'),
              Output('letter-filter', 'value'),
              Output('printer-filter-dropdown', 'options')],
-            [Input('font-type-store', 'data')],  # Just trigger on load
+            [Input('font-type-store', 'data')],  # Trigger on font-type change and on load
+            [State('letter-filter', 'value')],
             prevent_initial_call=False
         )
-        def init_filters(_):
+        def init_filters(_, current_selected):
+            # Build options for all letters
             letter_options = [{'label': f' {l}', 'value': l} for l in self._all_letters]
+            # Preserve previously selected letters when possible (persist through font changes)
+            if current_selected and isinstance(current_selected, list):
+                # Keep only letters that still exist in master list (defensive)
+                preserved = [l for l in current_selected if l in self._all_letters]
+                selected = preserved if preserved else self._all_letters
+            else:
+                selected = self._all_letters
+
             # Get unique printers
             unique_printers = sorted(set(self.impr_names))
             printer_options = [{'label': p, 'value': p} for p in unique_printers if p not in ['n. nan', 'm. missing']]
-            return letter_options, self._all_letters, printer_options
+            return letter_options, selected, printer_options
         
         # Filter books by printer
         @self.app.callback(
@@ -2131,7 +2084,7 @@ class BookSimilarityDashboard:
             'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
             'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
             'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
-            'width': '120px', 'minWidth': '120px'
+            'width': '120px', 'minWidth': '120px', 'maxWidth': '120px'
         }
         inactive_btn_style = {
             'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
@@ -2139,7 +2092,7 @@ class BookSimilarityDashboard:
             'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
             'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
             'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
-            'width': '120px', 'minWidth': '120px'
+            'width': '120px', 'minWidth': '120px', 'maxWidth': '120px'
         }
         
         # Show/Hide all labels on network graph
@@ -2154,16 +2107,17 @@ class BookSimilarityDashboard:
         )
         def toggle_network_labels(show_clicks, hide_clicks, current_fig):
             ctx = dash.callback_context
+            # Defensive default in case ctx.triggered has unexpected shape
+            show_labels = False
             if not ctx.triggered:
                 return dash.no_update, dash.no_update, dash.no_update
             
             trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
-            show_labels = trigger_id == 'show-all-labels-btn'
+            show_labels = (trigger_id == 'show-all-labels-btn')
             
-            # Set button styles based on which is active
-            show_style = {**active_btn_style} if show_labels else {**inactive_btn_style}
-            hide_style = {**active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'} if not show_labels else {**inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
-            show_style['marginBottom'] = '8px'
+            # Set button styles based on which is active (consistent margins)
+            show_style = {**active_btn_style, 'marginBottom': '8px'} if show_labels else {**inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            hide_style = {**active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'} if not show_labels else {**inactive_btn_style, 'marginBottom': '8px'}
             
             if not current_fig.get('data'):
                 return dash.no_update, show_style, hide_style
@@ -2352,13 +2306,12 @@ class BookSimilarityDashboard:
             trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
             show_all = trigger_id == 'show-all-network-printers-btn'
             
+            
+            # Keep margins consistent with other toggle callbacks
             # Set button styles based on which is active
-            active_style_mr = {**active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
-            inactive_style_mr = {**inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
-            
-            show_style = {**active_btn_style} if show_all else {**inactive_btn_style}
-            hide_style = active_style_mr if not show_all else inactive_style_mr
-            
+            show_style = {**active_btn_style, 'marginBottom': '8px'} if show_all else {**inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            hide_style = {**active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'} if not show_all else {**inactive_btn_style, 'marginBottom': '8px'}
+                        
             if not current_fig.get('data'):
                 return dash.no_update, show_style, hide_style, dash.no_update
             
@@ -2460,10 +2413,10 @@ class BookSimilarityDashboard:
                            'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
                            'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
                            'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
-                           'width': '130px', 'minWidth': '130px'}
+                           'width': '120px', 'minWidth': '120px', 'maxWidth': '120px'}
             inactive_style = {'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
                              'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
-                             'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '130px', 'minWidth': '130px'}
+                             'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '120px', 'minWidth': '120px', 'maxWidth': '120px'}
             if not store:
                 return dash.no_update, dash.no_update
             vals = list(store.values())
@@ -2483,10 +2436,19 @@ class BookSimilarityDashboard:
             prevent_initial_call=False
         )
         def sync_network_printer_buttons(store):
-            active_style = { 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500', 'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white','border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '120px', 'minWidth': '120px'}
-            active_style_mr = {**active_style, 'marginRight': '5px', 'marginBottom': '8px'}
-            inactive_style = { 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500', 'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040','border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '120px', 'minWidth': '120px'}
-            inactive_style_mr = {**inactive_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            active_style = {'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px', 'maxWidth': '120px'}
+            inactive_style = {'marginRight': '5px', 'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px', 'maxWidth': '120px'}
+            
             if not store:
                 return dash.no_update, dash.no_update
             vals = list(store.values())
@@ -2495,8 +2457,8 @@ class BookSimilarityDashboard:
             if all_visible:
                 return active_style, inactive_style
             if all_hidden:
-                return inactive_style_mr, active_style_mr
-            return inactive_style, inactive_style_mr
+                return inactive_style, active_style
+            return inactive_style, inactive_style
 
         # Sync selected books from dropdown to network graph and handle show/hide
         @self.app.callback(
@@ -3033,10 +2995,17 @@ class BookSimilarityDashboard:
                                 bg_color = f'rgba({r}, {g}, {b}, 0.35)'
                                 
                                 img_elements = []
-                                for img_path, encoded in book_images:
+                                for img_path, encoded_or_url in book_images:
+                                    # If we received a URL for a pre-extracted image, use it directly
+                                    if isinstance(encoded_or_url, str) and (encoded_or_url.startswith('/') or encoded_or_url.startswith('http')):
+                                        src = encoded_or_url
+                                    else:
+                                        # Legacy: base64 encoded image from pickle — assume PNG
+                                        src = f"data:image/png;base64,{encoded_or_url}"
+
                                     img_elements.append(
                                         html.Img(
-                                            src=f"data:image/png;base64,{encoded}",
+                                            src=src,
                                             style={'height': '70px', 'margin': '2px', 'border': '2px solid #ccc', 'borderRadius': '4px'}
                                         )
                                     )
