@@ -10,3 +10,4 @@ scripts/
 profiles/
 .dockerignore
 Dockerfile
+*.webp
