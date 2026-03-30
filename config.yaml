@@ -11,7 +11,7 @@ server:
   debug: false
   # URL prefix for reverse-proxy deployments (e.g. "/sueltas/").
   # Can also be set via the REQUESTS_PATHNAME_PREFIX env var.
-  requests_pathname_prefix: "/sueltas/"
+  requests_pathname_prefix: ""
 
 # --- Data files ---------------------------------------------------------------
 # Paths are relative to the working directory where launch_dashboard.py is run.
@@ -51,7 +51,7 @@ images:
   # "preload" loads all images into RAM at startup (fast browsing, more memory).
   # "lazy" only indexes directories; images are served on demand via HTTP
   #         (slower first view per book, but much faster startup & less memory).
-  loading_strategy: "lazy"
+  loading_strategy: "preload"
 
 # --- UMAP ---------------------------------------------------------------------
 umap:
