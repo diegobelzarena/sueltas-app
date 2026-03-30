@@ -33,4 +33,4 @@ images_cache/
 *.tar.gz
 _image_extract/
 _image_app/
-_pycache/
+__pycache__/
