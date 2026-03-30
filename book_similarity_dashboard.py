@@ -1797,6 +1797,17 @@ class BookSimilarityDashboard:
                         print(traceback.format_exc())
                         drilldown_node = None
 
+                # Compute maxv_linkage/maxv_offdiag for the active matrix
+                # (full matrix when no drill-down, sub-matrix when drilled down)
+                if sub_leaf_map is not None:
+                    active_n1hat = n1hat[np.ix_(sub_leaf_map, sub_leaf_map)]
+                else:
+                    active_n1hat = n1hat
+                maxv_linkage = float(np.max(active_n1hat))
+                active_offdiag = active_n1hat.copy().astype(float)
+                np.fill_diagonal(active_offdiag, 0.0)
+                maxv_offdiag = float(np.max(active_offdiag))
+
                 # --- If hiding singletons, rebuild linkage from non-singleton leaves only ---
                 # This ensures branch lines for singletons are removed entirely.
                 def _orig_idx_base(slm, i):
@@ -1883,14 +1894,18 @@ class BookSimilarityDashboard:
                     return 'rgba(120,120,120,0.4)'
 
                 # Draw branches: swap coords for horizontal layout
+                # Transform x from distance to shared types: shared = maxv_linkage - dist
                 # Store branch data for potential fading (applied after highlight logic)
+                # All leaves placed at maxv_offdiag + 1 (right edge, beyond any branch)
+                leaf_x_val = maxv_offdiag + 1
+
                 branch_traces = []
                 branch_leaf_sets = []  # which leaf indices each branch connects to
                 for xs_orig, ys_orig in zip(icoord, dcoord):
                     bc = _branch_color(xs_orig, ys_orig)
-                    # icoord values → y (leaf space), dcoord values → x (distance)
+                    # icoord values → y (leaf space), dcoord values → x (distance → shared types)
                     ys_new = list(xs_orig)
-                    xs_new = list(ys_orig)
+                    xs_new = [min(maxv_linkage - d, leaf_x_val) for d in ys_orig]
                     # Track which leaf indices this branch touches
                     branch_leaves = set()
                     for x_val in [xs_orig[0], xs_orig[3]]:
@@ -1910,7 +1925,7 @@ class BookSimilarityDashboard:
                 # --- Leaf markers with rich tooltips ---
                 n_leaves = len(leaves)
                 leaf_y_pos = np.array([(i * 10) + 5 for i in range(n_leaves)])
-                leaf_x_pos = np.zeros(n_leaves)  # leaves at x=0 (distance=0)
+                leaf_x_pos = np.full(n_leaves, leaf_x_val)
 
                 leaf_colors = []
                 leaf_sizes = []
@@ -2039,9 +2054,10 @@ class BookSimilarityDashboard:
 
                 fig.update_layout(
                     title=dict(text=title_text, font=dict(size=13, family='Inter, Arial, sans-serif', color='#5a5040')),
-                    xaxis=dict(title='Linkage distance', showgrid=True, gridcolor='rgba(0,0,0,0.06)',
+                    xaxis=dict(title='Shared letter types', showgrid=True, gridcolor='rgba(0,0,0,0.06)',
                                zeroline=True, zerolinecolor='rgba(0,0,0,0.1)', side='top',
-                               autorange='reversed'),
+                               range=[-0.5, leaf_x_val + 0.5],
+                               dtick=max(1, int(maxv_offdiag / 8))),
                     yaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
                     height=fig_height,
                     margin=dict(t=60, b=20, l=40, r=200),
@@ -2049,6 +2065,14 @@ class BookSimilarityDashboard:
                     paper_bgcolor='rgba(0,0,0,0)',
                     hoverlabel=dict(bgcolor='white', font_size=12, font_family='Inter, Arial, sans-serif'),
                 )
+
+                # Vertical reference line at cut level
+                fig.add_vline(x=level, line_width=1.5, line_dash='dash',
+                              line_color='rgba(180,60,60,0.6)',
+                              annotation_text=f'cut = {level}',
+                              annotation_position='top',
+                              annotation_font=dict(size=10, color='rgba(180,60,60,0.8)',
+                                                   family='Inter, Arial, sans-serif'))
 
                 level_label = f"Groups: {len(unique_labels)} — largest group size: {max(_grp_sizes.values()) if _grp_sizes else 0}"
 
@@ -2210,10 +2234,11 @@ class BookSimilarityDashboard:
         @self.app.callback(
             [Output('additional-books-dropdown', 'value', allow_duplicate=True), Output('network-selected-books-visibility-store', 'data', allow_duplicate=True)],
             [Input({'type':'dendro-select-group-btn', 'index': ALL}, 'n_clicks')],
-            [State('dendro-level-slider', 'value'), State('dendro-font-store','data'), State('additional-books-dropdown', 'value')],
+            [State('dendro-level-slider', 'value'), State('dendro-font-store','data'),
+             State('additional-books-dropdown', 'value'), State('dendro-drilldown-store', 'data')],
             prevent_initial_call=True
         )
-        def select_group_from_dendro(n_clicks_list, level, font, dropdown_val):
+        def select_group_from_dendro(n_clicks_list, level, font, dropdown_val, drilldown_node):
             ctx = dash.callback_context
             if not ctx.triggered:
                 return dash.no_update, dash.no_update
@@ -2236,11 +2261,20 @@ class BookSimilarityDashboard:
                     n1hat = self.n1hat_rm
                 else:
                     n1hat = self.n1hat_rm + self.n1hat_it
-                adj = (n1hat >= level).astype(int)
-                np.fill_diagonal(adj, 0)
-                G = csr_matrix(adj)
-                _, labels = connected_components(G, directed=False)
-                nodes = np.where(labels == label)[0]
+                # If drilled down, compute labels on the sub-matrix
+                if drilldown_node is not None and isinstance(drilldown_node, list):
+                    sub_leaves = sorted(int(x) for x in drilldown_node)
+                    sub_n1hat = n1hat[np.ix_(sub_leaves, sub_leaves)]
+                    sub_adj = (sub_n1hat >= level).astype(int)
+                    np.fill_diagonal(sub_adj, 0)
+                    _, sub_labels = connected_components(csr_matrix(sub_adj), directed=False)
+                    matched = np.where(sub_labels == label)[0]
+                    nodes = [sub_leaves[int(i)] for i in matched]
+                else:
+                    adj = (n1hat >= level).astype(int)
+                    np.fill_diagonal(adj, 0)
+                    _, labels = connected_components(csr_matrix(adj), directed=False)
+                    nodes = list(np.where(labels == label)[0])
                 books_to_add = [self.books[int(i)] for i in nodes]
             except Exception as e:
                 print('Error computing group nodes for select:', e)
@@ -2284,10 +2318,11 @@ class BookSimilarityDashboard:
         @self.app.callback(
             Output('dendro-drilldown-store', 'data', allow_duplicate=True),
             [Input({'type': 'dendro-drilldown-group-btn', 'index': ALL}, 'n_clicks')],
-            [State('dendro-level-slider', 'value'), State('dendro-font-store', 'data')],
+            [State('dendro-level-slider', 'value'), State('dendro-font-store', 'data'),
+             State('dendro-drilldown-store', 'data')],
             prevent_initial_call=True
         )
-        def drilldown_into_group(n_clicks_list, level, font):
+        def drilldown_into_group(n_clicks_list, level, font, drilldown_node):
             ctx = dash.callback_context
             if not ctx.triggered:
                 return dash.no_update
@@ -2308,10 +2343,20 @@ class BookSimilarityDashboard:
                     n1hat = self.n1hat_rm
                 else:
                     n1hat = self.n1hat_rm + self.n1hat_it
-                adj = (n1hat >= level).astype(int)
-                np.fill_diagonal(adj, 0)
-                _, labels = connected_components(csr_matrix(adj), directed=False)
-                nodes = sorted(int(x) for x in np.where(labels == label)[0])
+                # If already drilled down, compute labels on the sub-matrix
+                if drilldown_node is not None and isinstance(drilldown_node, list):
+                    sub_leaves = sorted(int(x) for x in drilldown_node)
+                    sub_n1hat = n1hat[np.ix_(sub_leaves, sub_leaves)]
+                    sub_adj = (sub_n1hat >= level).astype(int)
+                    np.fill_diagonal(sub_adj, 0)
+                    _, sub_labels = connected_components(csr_matrix(sub_adj), directed=False)
+                    matched = np.where(sub_labels == label)[0]
+                    nodes = sorted(sub_leaves[int(i)] for i in matched)
+                else:
+                    adj = (n1hat >= level).astype(int)
+                    np.fill_diagonal(adj, 0)
+                    _, labels = connected_components(csr_matrix(adj), directed=False)
+                    nodes = sorted(int(x) for x in np.where(labels == label)[0])
                 if len(nodes) > 2:
                     return nodes
             except Exception as e:
