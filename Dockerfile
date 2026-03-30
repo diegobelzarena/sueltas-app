@@ -10,7 +10,7 @@
 # RUN:
 #   docker run -d -p 8050:8050 sueltas-app
 
-FROM python:3.11.15-slim
+FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

@@ -1,6 +1,11 @@
 services:
   dashboard:
-    build: .
+    build:
+      context: .
+      network: host
+      args:
+        HTTP_PROXY: ${HTTP_PROXY}
+        HTTPS_PROXY: ${HTTPS_PROXY}
     ports:
       - "8050:8050"
     restart: unless-stopped
