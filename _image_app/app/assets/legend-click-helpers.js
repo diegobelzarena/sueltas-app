@@ -1,6 +1,6 @@
 (function(){
     // Configurable double-click threshold (ms). Increase to make double-click detection more forgiving.
-    const DOUBLE_CLICK_THRESHOLD = 400;
+    const DOUBLE_CLICK_THRESHOLD = 3000; // 500ms
 
     // Helper to attach handler to a given plotly graph element
     function attachLegendClickHandler(gd){

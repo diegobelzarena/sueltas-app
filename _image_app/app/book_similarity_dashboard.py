@@ -19,7 +19,6 @@ from concurrent.futures import ThreadPoolExecutor
 import tempfile
 from flask import send_from_directory, abort
 import time
-import umap_utils
 
 class BookSimilarityDashboard:
     # Cache size limits for memory optimization
@@ -29,36 +28,24 @@ class BookSimilarityDashboard:
     # Default settings for edge cache behavior
     EDGE_CACHE_MAX_FILES = 3  # Keep at most 3 edge cache files by default (LRU)
 
-    def __init__(self, requests_pathname_prefix='', config=None):
+    def __init__(self, requests_pathname_prefix=''):
         """Initialize dashboard.
 
         requests_pathname_prefix: optional URL prefix where the app is mounted
         (e.g. '/investigacion/grupos/gti/sueltas/'). When provided, pass it
         to Dash so URLs and `_dash-config` are generated correctly.
-        config: optional dict loaded from config.yaml (see config.yaml for keys).
         """
-        cfg = config or {}
-        net_cfg = cfg.get("network", {})
-        cache_cfg = cfg.get("cache", {})
-        img_cfg = cfg.get("images", {})
-
-        self.config = cfg
         self.books = None
         self.impr_names = None
         self.symbs = None
         self.n1hat_rm = None
         self.n1hat_it = None
-        self.top_k = net_cfg.get("top_k", 5000)
-        self.n_bins = net_cfg.get("n_bins", 10)
-
-        self.MAX_FIGURE_CACHE_SIZE = cache_cfg.get("max_figure_entries", 10)
-        self.MAX_UMAP_CACHE_SIZE = cache_cfg.get("max_umap_entries", 5)
-        self.EDGE_CACHE_MAX_FILES = cache_cfg.get("edge_cache_max_files", 3)
-
+        self.top_k = 5000  # For network graphs (reduced for memory efficiency)
+        self.n_bins = 10 
+        
         # Serve images from static folder
         self.letter_images_path = './letter_images/'
-        self._cache_dir = img_cfg.get("cache_dir", './images_cache/')
-        self._image_loading_strategy = img_cfg.get("loading_strategy", "preload")
+        self._cache_dir = './images_cache/'  # Directory for per-book cache files
         os.makedirs(self._cache_dir, exist_ok=True)
 
         # Track last selected font to know when to reload edge caches
@@ -84,23 +71,19 @@ class BookSimilarityDashboard:
         """
         Initialize the dashboard with your data.
         """
-        data_cfg = self.config.get("data", {})
-        umap_cfg = self.config.get("umap", {})
-        self._umap_n_neighbors = umap_cfg.get("n_neighbors", 50)
-        self._umap_min_dist = umap_cfg.get("min_dist", 0.5)
-
-        self.n1hat_it = np.load(data_cfg.get("n1hat_it_matrix", './n1hat_it_matrix_ordered.npy'), mmap_mode='r')
-        self.n1hat_rm = np.load(data_cfg.get("n1hat_rm_matrix", './n1hat_rm_matrix_ordered.npy'), mmap_mode='r')
-        self.books = np.load(data_cfg.get("books", './books_dashboard_ordered.npy'), mmap_mode='r')
-        self.impr_names = np.load(data_cfg.get("impr_names", './impr_names_dashboard_ordered.npy'), mmap_mode='r')
-        self.symbs = np.load(data_cfg.get("symbs", './symbs_dashboard.npy'), mmap_mode='r')
+        
+        self.n1hat_it = np.load('./n1hat_it_matrix_ordered.npy', mmap_mode='r')
+        self.n1hat_rm = np.load('./n1hat_rm_matrix_ordered.npy', mmap_mode='r')
+        self.books = np.load('./books_dashboard_ordered.npy', mmap_mode='r')
+        self.impr_names = np.load('./impr_names_dashboard_ordered.npy', mmap_mode='r')
+        self.symbs = np.load('./symbs_dashboard.npy', mmap_mode='r')
         print(" Loaded ordered .npy files")
         
         # Decide whether to load weight memmaps: only if edge caches are missing
         fonts = ['roman', 'italic', 'combined']
         need_edges = any(not os.path.exists(self._edge_cache_path(font, self.top_k, self.n_bins)) for font in fonts)
         # Check for per-font combined UMAP file (we only load combined positions at startup if present)
-        combined_umap_file = f'./umap_combined_{self._umap_n_neighbors}_{self._umap_min_dist}.npy'
+        combined_umap_file = f'./umap_combined_50_0.5.npy'
         combined_umap_present = os.path.exists(combined_umap_file)
 
         # Check the dtype of n1hat_rm, n1hat_it
@@ -138,8 +121,8 @@ class BookSimilarityDashboard:
 
         if need_edges:
             # Only load weight memmaps when needed for missing caches
-            w_rm_mmap = np.load(data_cfg.get("w_rm_matrix", './w_rm_matrix_ordered.npy'), mmap_mode='r')
-            w_it_mmap = np.load(data_cfg.get("w_it_matrix", './w_it_matrix_ordered.npy'), mmap_mode='r')
+            w_rm_mmap = np.load('./w_rm_matrix_ordered.npy', mmap_mode='r')
+            w_it_mmap = np.load('./w_it_matrix_ordered.npy', mmap_mode='r')
             self._w_rm_mmap = w_rm_mmap
             self._w_it_mmap = w_it_mmap
             print("Loaded weight matrices as memory-mapped (needed for missing caches).")
@@ -378,18 +361,28 @@ class BookSimilarityDashboard:
         return traces
     
                 
-    def _load_umap_positions(self, font_type='combined', w_rm=None, w_it=None, w_combined=None, n_neighbors=None, min_dist=None, compute_if_missing=False):
-        """Load (or compute) UMAP positions.  Delegates to umap_utils."""
-        if n_neighbors is None:
-            n_neighbors = getattr(self, '_umap_n_neighbors', 50)
-        if min_dist is None:
-            min_dist = getattr(self, '_umap_min_dist', 0.5)
-        return umap_utils.load_positions(
-            font_type=font_type,
-            n_neighbors=n_neighbors,
-            min_dist=min_dist,
-            compute_if_missing=compute_if_missing,
-        )
+    def _load_umap_positions(self, font_type='combined', w_rm=None, w_it=None, w_combined=None, n_neighbors=50, min_dist=0.5, compute_if_missing=False):
+        """Load or compute UMAP positions for a given font_type ('roman', 'italic', 'combined').
+
+        This creates/uses per-font cached files named like: ./umap_{font_type}_{n_neighbors}_{min_dist}.npy
+        By default, callers with no font_type supplied get 'combined' (keeps startup behavior).
+        The 'compute_if_missing' flag controls whether missing UMAP files are computed or deferred.
+        """
+        # filename includes font type to allow per-font UMAP position caches
+        umap_file = f'./umap_{font_type}_{n_neighbors}_{min_dist}.npy'
+
+        # if file exists, load it
+        if os.path.exists(umap_file):
+            umap_positions = np.load(umap_file)
+            print(f"Loaded UMAP positions from {umap_file}")
+            print(f"UMAP positions shape: {umap_positions.shape}")
+            return self._orient_umap_positions(umap_positions)
+
+        if not compute_if_missing:
+            print(f"UMAP file {umap_file} missing — computation deferred until requested.")
+            return None
+        
+        return None
 
     def _register_image_route(self):
         """Register a Flask route to serve images from the images_cache directory.
@@ -501,58 +494,16 @@ class BookSimilarityDashboard:
     
     def _load_metadata_for_letter_images(self):
         """
-        Load global metadata (all_letters) and prepare image access.
-
-        Respects self._image_loading_strategy from config.yaml:
-          - "preload" (default): read every WebP into RAM as base64 for instant display.
-          - "lazy": only build the directory index; images are served on-demand via Flask.
+        Build per-book image pickle files if missing, and load global metadata (all_letters).
         """
+        # Check if per-book pickle files exist for all books
         with open(f'{self._cache_dir}/images_cache_meta.pkl', 'rb') as f:
             self.meta = pickle.load(f)
         self._all_letters = self.meta.get('all_letters', [])
         print(f"Loaded metadata from images_cache_meta.pkl ({len(self._all_letters)} letters)")
-
-        if self._image_loading_strategy == 'preload':
-            self._preload_all_images()
-        else:
-            self._build_image_index()
-
-    def _get_linkage_subtree_leaves(self, lk, node_id, n):
-        """Return sorted list of original leaf indices under linkage node `node_id`."""
-        if node_id < n:
-            return [node_id]
-        row = node_id - n
-        if row < 0 or row >= len(lk):
-            return []
-        left, right = int(lk[row, 0]), int(lk[row, 1])
-        return sorted(self._get_linkage_subtree_leaves(lk, left, n) +
-                       self._get_linkage_subtree_leaves(lk, right, n))
-
-    def _build_image_index(self):
-        """Scan image directories to build _image_index without loading file contents.
-
-        Used by the 'lazy' loading strategy.  Images are served on demand via
-        the Flask route registered in _register_image_route().
-        """
-        self._image_cache = {}
-        self._image_index = {}
-        t0 = time.time()
-        try:
-            for entry in os.scandir(self._cache_dir):
-                if not entry.is_dir():
-                    continue
-                book_files = [
-                    fentry.name
-                    for fentry in os.scandir(entry.path)
-                    if fentry.is_file() and fentry.name.lower().endswith('.webp')
-                ]
-                self._image_index[entry.name] = book_files
-            elapsed = time.time() - t0
-            n_files = sum(len(v) for v in self._image_index.values())
-            print(f"Built image index ({len(self._image_index)} books, {n_files} files) in {elapsed:.2f}s [lazy mode]")
-        except Exception as e:
-            print(f"Warning: Image index build failed: {e}")
-            self._image_index = {}
+        
+        # Preload all images as base64 data URLs for instant display
+        self._preload_all_images()
 
     def _preload_all_images(self):
         """Preload all WebP images as base64 data URLs.
@@ -616,6 +567,28 @@ class BookSimilarityDashboard:
             self._image_index = {}
 
 
+    
+    # def _compute_umap_positions(self, distance_matrix, n_neighbors=50, min_dist=0.5, random_state=42):
+    #     """Compute UMAP positions from distance matrix"""
+    #     if not UMAP_AVAILABLE:
+    #         print("UMAP not available, falling back to spring layout")
+    #         return None
+        
+    #     try:
+    #         reducer = umap.UMAP(
+    #             metric='precomputed',
+    #             n_neighbors=n_neighbors,
+    #             min_dist=min_dist,
+    #             n_components=2,
+    #             random_state=random_state,
+    #         )
+    #         # UMAP expects float32 input for best performance/compatibility
+    #         dm = distance_matrix.astype(np.float32, copy=False)
+    #         positions = reducer.fit_transform(dm)
+    #         return positions
+    #     except Exception as e:
+    #         print(f"UMAP failed: {e}, falling back to spring layout")
+    #         return None
     
     def _get_printer_colors(self):
         """Get color mapping for printers - matching heatmap colors/markers"""
@@ -841,8 +814,22 @@ class BookSimilarityDashboard:
         return fig
 
     def _orient_umap_positions(self, umap_positions):
-        """Delegate to umap_utils.orient_positions."""
-        return umap_utils.orient_positions(umap_positions)
+        """Rotate (swap axes) so the axis with the larger range is placed on the x-axis.
+        This helps the network occupy more horizontal space in wide layouts.
+        """
+        umap_positions = np.asarray(umap_positions, dtype=np.float32)
+        # Guard for empty input or unexpected shapes
+        if umap_positions.size == 0 or umap_positions.ndim != 2 or umap_positions.shape[1] < 2:
+            return umap_positions
+        x_range = np.nanmax(umap_positions[:, 0]) - np.nanmin(umap_positions[:, 0])
+        y_range = np.nanmax(umap_positions[:, 1]) - np.nanmin(umap_positions[:, 1])
+        if y_range > x_range:
+            # Swap columns so the larger spread becomes x
+            rotated = umap_positions[:, [1, 0]].copy()
+            # Debug log (uncomment if needed)
+            # print("Rotated UMAP positions: swapped x/y to maximize horizontal spread")
+            return rotated
+        return umap_positions
 
     def _update_network_edges(self, current_fig, edge_opacity, umap_pos_array, font_type, selected_books=None):
         """Update edge traces in the network figure for new weight_matrix and threshold, keeping node traces.
@@ -1080,513 +1067,615 @@ class BookSimilarityDashboard:
             
     
     
-    # ------------------------------------------------------------------
-    # Layout sub-methods — each returns a Dash component tree
-    # ------------------------------------------------------------------
-
-    def _build_page_header(self):
-        """Page title and subtitle."""
-        return html.Div([
-            html.H1("Theatre Chapbooks At Scale",
-                     style={'textAlign': 'center', 'margin': '0', 'fontFamily': 'Inter, Arial, sans-serif',
-                            'fontWeight': '700', 'fontSize': '2.2rem', 'color': '#374151',
-                            'letterSpacing': '-0.5px'}),
-            html.P("A Statistical Comparative Analysis of Typography",
-                    style={'textAlign': 'center', 'margin': '5px 0 0 0', 'fontFamily': 'Inter, Arial, sans-serif',
-                           'fontWeight': '400', 'fontSize': '1rem', 'color': '#887C57',
-                           'letterSpacing': '0.5px'}),
-        ], style={'marginBottom': '20px', 'padding': '20px 0'})
-
-    def _build_font_selector(self):
-        """Global font-type selector bar (Combined / Roman / Italic)."""
-        active = {'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
-                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
-                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
-                  'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
-                  'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}
-        inactive = {**active, 'backgroundColor': '#DBD1B5', 'color': '#5a5040'}
-        inactive_last = {**inactive, 'marginRight': '0'}
-
-        return html.Div([
-            html.Div([
-                html.Div(
-                    html.Label("Font type",
-                               style={'fontSize': '13px', 'fontWeight': '600', 'color': '#887C57',
-                                      'fontFamily': 'Inter, Arial, sans-serif'}),
-                    style={'position': 'absolute', 'left': '20px', 'top': '50%', 'transform': 'translateY(-50%)'}
-                ),
-                html.Div([
-                    html.Button("Combined", id='font-combined-btn', n_clicks=0, style=active),
-                    html.Button("Roman", id='font-roman-btn', n_clicks=0, style=inactive),
-                    html.Button("Italic", id='font-italic-btn', n_clicks=0, style=inactive_last),
-                ], style={'display': 'flex', 'justifyContent': 'center', 'width': '100%'}),
-                dcc.Store(id='font-type-store', data='combined'),
-            ], style={'position': 'relative', 'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center'})
-        ], style={'marginBottom': '15px', 'padding': '12px 20px', 'backgroundColor': '#DBD1B5',
-                  'borderRadius': '8px', 'boxShadow': '0 2px 4px rgba(0,0,0,0.15)'})
-
-    def _build_data_stores(self, initial_umap_list):
-        """Hidden dcc.Store components that persist application state."""
-        return [
-            dcc.Store(id='umap-positions-store', data=initial_umap_list),
-            dcc.Store(id='network-selected-books-store', data=[]),
-            dcc.Store(id='network-selected-books-visibility-store', data=False),
-            dcc.Store(id='network-legend-visibility-store', data={}),
-            dcc.Store(id='heatmap-legend-visibility-store', data={}),
-        ]
-
-    def _build_heatmap_and_comparison(self, initial_heatmap_fig):
-        """Similarity matrix (left) + letter comparison panel (right)."""
-        section_header = html.Div(
-            html.H3("Typographic Similarity Analysis",
-                     style={"margin": "0", "fontFamily": "Inter, Arial, sans-serif",
-                            "fontWeight": "600", "letterSpacing": "0.5px", "color": "#887C57"}),
-            style={"textAlign": "center", "padding": "6px 0", "backgroundColor": "#F8F5EC",
-                   "borderRadius": "6px", "marginBottom": "10px",
-                   "boxShadow": "0 1px 2px rgba(0,0,0,0.15)"})
-
-        heatmap_col = html.Div([
-            html.Div("Similarity Matrix",
-                      style={'textAlign': 'center', 'marginBottom': '8px', 'fontFamily': 'Inter, Arial, sans-serif',
-                             'fontWeight': '600', 'fontSize': '13px', 'color': '#887C57'}),
-            html.Div([
-                html.Button("Hide Printers", id='hide-all-printers-btn', n_clicks=0,
-                             style={'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
-                                    'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
-                                    'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
-                                    'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
-                                    'width': '110px', 'minWidth': '110px'}),
-                html.Button("Show Printers", id='show-all-printers-btn', n_clicks=0,
-                             style={'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
-                                    'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
-                                    'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
-                                    'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
-                                    'width': '110px', 'minWidth': '110px'}),
-            ], style={'marginBottom': '8px', 'textAlign': 'center'}),
-            dcc.Graph(id='similarity-heatmap', figure=initial_heatmap_fig,
-                      style={'width': '100%', 'aspectRatio': '1 / 1', 'borderRadius': '8px',
-                             'boxShadow': '0 1px 3px rgba(0,0,0,0.2)s', "margin": "0 auto"},
-                      config={'responsive': True})
-        ], style={'flex': '1 1 45%', 'minWidth': '0', 'maxWidth': '48%', 'boxSizing': 'border-box',
-                  'backgroundColor': '#F8F5EC', 'borderRadius': '8px', 'padding': '2px', 'overflow': 'hidden'})
-
-        comparison_col = html.Div([
-            html.Div("Letter Comparison",
-                      style={'textAlign': 'center', 'marginBottom': '8px', 'fontFamily': 'Inter, Arial, sans-serif',
-                             'fontWeight': '600', 'fontSize': '13px', 'color': '#887C57'}),
-            # Printer filter
-            html.Div([
-                html.Label("Filter by printer: ",
-                            style={'fontWeight': '500', 'marginRight': '10px', 'fontSize': '11px',
-                                   'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}),
-                dcc.Dropdown(id='printer-filter-dropdown', options=[], value=None, multi=False,
-                             placeholder='All printers', clearable=True, style={'width': '100%', 'fontSize': '11px'}),
-                html.Button("Select all from this printer", id='select-all-printer-books-btn', n_clicks=0,
-                             style={'marginTop': '5px', 'padding': '6px 12px', 'fontSize': '11px', 'fontWeight': '500',
-                                    'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
-                                    'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'none',
-                                    'boxShadow': '0 1px 3px rgba(0,0,0,0.2)'}),
-            ], style={'marginBottom': '8px', 'padding': '8px', 'backgroundColor': '#DBD1B5', 'borderRadius': '6px'}),
-            # Book selector
-            html.Div([
-                html.Label("Select books: ",
-                            style={'fontWeight': '500', 'marginRight': '10px', 'fontSize': '11px',
-                                   'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}),
-                html.Button("Clear", id='clear-comparison-btn', n_clicks=0,
-                             style={'float': 'right', 'padding': '4px 10px', 'fontSize': '10px', 'fontWeight': '500',
-                                    'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
-                                    'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
-                                    'boxShadow': '0 1px 3px rgba(0,0,0,0.2)'}),
-                dcc.Dropdown(id='additional-books-dropdown', options=[], value=[], multi=True,
-                             placeholder='+ Click matrix or select books here...', style={'width': '100%', 'fontSize': '11px'}),
-                dcc.Store(id='clicked-books-store', data=[]),
-            ], style={'marginBottom': '8px', 'padding': '8px', 'backgroundColor': '#DBD1B5', 'borderRadius': '6px'}),
-            # Letter filter
-            html.Div([
-                html.Label("Filter: ", style={'fontWeight': '500', 'marginRight': '5px', 'fontSize': '11px',
-                                               'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}),
-                html.Button("All", id='select-all-letters', n_clicks=0,
-                             style={'marginRight': '3px', 'padding': '4px 8px', 'fontSize': '10px', 'fontWeight': '500',
-                                    'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
-                                    'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
-                html.Button("None", id='select-no-letters', n_clicks=0,
-                             style={'marginRight': '8px', 'padding': '4px 8px', 'fontSize': '10px', 'fontWeight': '500',
-                                    'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
-                                    'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
-                html.Button("a-z", id='select-lowercase', n_clicks=0,
-                             style={'marginRight': '3px', 'padding': '4px 8px', 'fontSize': '10px', 'fontWeight': '500',
-                                    'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
-                                    'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
-                html.Button("A-Z", id='select-uppercase', n_clicks=0,
-                             style={'marginRight': '8px', 'padding': '4px 8px', 'fontSize': '10px', 'fontWeight': '500',
-                                    'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
-                                    'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
-                dcc.Checklist(id='letter-filter', options=[], value=[], inline=True,
-                              style={'display': 'inline-block', 'fontSize': '11px'},
-                              inputStyle={'marginRight': '2px', 'marginLeft': '6px'})
-            ], style={'marginBottom': '8px', 'padding': '8px', 'backgroundColor': '#DBD1B5', 'borderRadius': '6px'}),
-            # Comparison output
-            html.Div(id='letter-comparison-panel',
-                      style={'border': '1px solid #d1c7ad', 'borderRadius': '6px', 'padding': '15px',
-                             'backgroundColor': '#F8F5EC', 'minHeight': '500px', 'maxHeight': '800px', 'overflowY': 'auto'},
-                      children=[html.P("Click on a cell in the similarity matrix or a node in the network graph",
-                                        style={'textAlign': 'center', 'color': '#6b7280', 'marginTop': '200px',
-                                               'fontSize': '13px', 'fontFamily': 'Inter, Arial, sans-serif'})])
-        ], style={'flex': '1 1 45%', 'minWidth': '0', 'maxWidth': '48%', 'boxSizing': 'border-box',
-                  'backgroundColor': '#F8F5EC', 'borderRadius': '8px', 'padding': '10px', 'overflow': 'hidden'})
-
-        return html.Div([
-            section_header,
-            html.Div([heatmap_col, comparison_col],
-                      style={'display': 'flex', 'gap': '2%', 'alignItems': 'flex-start', 'justifyContent': 'space-between'}),
-        ], style={"width": "100%", "backgroundColor": "#DBD1B5", "borderRadius": "8px",
-                  "boxShadow": "0 2px 4px rgba(0,0,0,0.15)", "padding": "10px", "marginBottom": "20px"})
-
-    def _build_network_section(self, initial_network_fig):
-        """Network graph with controls (visibility toggles, sliders, UMAP source)."""
-        net_cfg = self.config.get("network", {})
-        edge_opacity_val = net_cfg.get("edge_opacity", 1.0)
-        node_size_val = net_cfg.get("node_size", 12)
-        label_size_val = net_cfg.get("label_size", 8)
-
-        section_header = html.Div(
-            html.H3("Graph of Typographic Similarity",
-                     style={"margin": "0", "fontFamily": "Inter, Arial, sans-serif",
-                            "fontWeight": "600", "letterSpacing": "0.5px", "color": "#887C57"}),
-            style={"textAlign": "center", "padding": "6px 0", "backgroundColor": "#F8F5EC",
-                   "borderRadius": "6px", "marginBottom": "10px",
-                   "boxShadow": "0 1px 2px rgba(0,0,0,0.15)"})
-
-        # --- Reusable button style helpers ---
-        _toggle_base = {'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
-                        'fontFamily': 'Inter, Arial, sans-serif', 'border': 'none', 'borderRadius': '6px',
-                        'cursor': 'pointer', 'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
-                        'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'transition': 'background-color 0.15s ease, transform 0.05s ease',
-                        'lineHeight': '1', 'width': '120px', 'minWidth': '120px'}
-        _active = {**_toggle_base, 'backgroundColor': '#2f4a84', 'color': 'white'}
-        _inactive = {**_toggle_base, 'backgroundColor': '#DBD1B5', 'color': '#5a5040'}
-        _active_mr = {**_active, 'marginRight': '5px'}
-        _inactive_mr = {**_inactive, 'marginRight': '5px'}
-
-        col1 = html.Div([
-            html.Div([
-                html.Button("Hide Labels", id='hide-all-labels-btn', n_clicks=0, style=_inactive_mr),
-                html.Button("Show Labels", id='show-all-labels-btn', n_clicks=0, style=_active),
-                html.Br(),
-                html.Button("Hide Markers", id='hide-all-markers-btn', n_clicks=0, style=_inactive_mr),
-                html.Button("Show Markers", id='show-all-markers-btn', n_clicks=0, style=_active),
-                html.Br(),
-                html.Button("Hide Printers", id='hide-all-network-printers-btn', n_clicks=0, style=_inactive_mr),
-                html.Button("Show Printers", id='show-all-network-printers-btn', n_clicks=0, style=_active),
-                html.Br(),
-                html.Button("Hide Selected", id='hide-selected-books-btn', n_clicks=0, style=_active_mr),
-                html.Button("Show Selected", id='show-selected-books-btn', n_clicks=0, style=_inactive),
-            ], style={'display': 'inline-block', 'textAlign': 'center'})
-        ], style={'width': '30%', 'flexShrink': '0', 'flexGrow': '0', 'display': 'flex',
-                  'alignItems': 'center', 'justifyContent': 'center'})
-
-        slider_label = {'fontSize': '11px', 'fontWeight': '500', 'color': 'dimgray',
-                        'fontFamily': 'Inter, Arial, sans-serif', 'marginBottom': '2px'}
-        col2 = html.Div([
-            html.Div([
-                html.Div([
-                    html.Label("Edge Opacity:", style=slider_label),
-                    dcc.Slider(id='edge-opacity-slider', min=0, max=2, step=0.1, value=edge_opacity_val,
-                               marks={0: {'label': '0', 'style': {'fontSize': '10px'}},
-                                      1: {'label': '1', 'style': {'fontSize': '10px'}},
-                                      2: {'label': '2', 'style': {'fontSize': '10px'}}},
-                               tooltip={"placement": "bottom", "always_visible": False}, className="compact-slider")
-                ], style={'marginBottom': '-10px'}),
-                html.Div([
-                    html.Label("Node Size:", style=slider_label),
-                    dcc.Slider(id='node-size-slider', min=6, max=24, step=1, value=node_size_val,
-                               marks={6: {'label': '6', 'style': {'fontSize': '10px'}},
-                                      15: {'label': '15', 'style': {'fontSize': '10px'}},
-                                      24: {'label': '24', 'style': {'fontSize': '10px'}}},
-                               tooltip={"placement": "bottom", "always_visible": False}, className="compact-slider"),
-                ], style={'marginBottom': '-10px'}),
-                html.Div([
-                    html.Label("Label Size:", style=slider_label),
-                    dcc.Slider(id='label-size-slider', min=6, max=24, step=1, value=label_size_val,
-                               marks={6: {'label': '6', 'style': {'fontSize': '10px'}},
-                                      15: {'label': '15', 'style': {'fontSize': '10px'}},
-                                      24: {'label': '24', 'style': {'fontSize': '10px'}}},
-                               tooltip={"placement": "bottom", "always_visible": False}, className="compact-slider"),
-                ]),
-            ], style={'width': '85%'})
-        ], style={'width': '30%', 'flexShrink': '0', 'flexGrow': '0', 'display': 'flex',
-                  'flexDirection': 'column', 'justifyContent': 'center'})
-
-        umap_active = {'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
-                       'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
-                       'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
-                       'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
-                       'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}
-        umap_inactive = {**umap_active, 'backgroundColor': '#DBD1B5', 'color': '#5a5040'}
-        umap_inactive_last = {**umap_inactive, 'marginRight': '0'}
-
-        col3 = html.Div([
-            html.Div([
-                html.Div("Node positions source",
-                          style={'fontWeight': '600', 'fontSize': '11px', 'color': '#887C57',
-                                 'marginBottom': '8px', 'textAlign': 'center', 'fontFamily': 'Inter, Arial, sans-serif'}),
-                html.Div([
-                    html.Button("Combined", id='umap-pos-combined-btn', n_clicks=0, style=umap_active),
-                    html.Button("Roman", id='umap-pos-roman-btn', n_clicks=0, style=umap_inactive),
-                    html.Button("Italic", id='umap-pos-italic-btn', n_clicks=0, style=umap_inactive_last),
-                ], style={'display': 'flex', 'justifyContent': 'center', 'gap': '2px'})
-            ], style={'backgroundColor': '#DBD1B5', 'borderRadius': '8px', 'padding': '8px 10px', 'width': '100%'})
-        ], style={'width': '30%', 'flexShrink': '0', 'flexGrow': '0', 'display': 'flex',
-                  'alignItems': 'center', 'justifyContent': 'center'})
-
-        controls_row = html.Div([col1, col2, col3],
-                                 style={'marginBottom': '5px', 'padding': '10px', 'backgroundColor': "#DBD1B5",
-                                        'borderRadius': '8px', 'display': 'flex', 'flexWrap': 'nowrap',
-                                        'alignItems': 'stretch', 'justifyContent': 'space-between'})
-
-        return html.Div([
-            section_header,
-            dcc.Store(id='umap-pos-source-store', data='combined'),
-            controls_row,
-            dcc.Graph(id='network-graph', figure=initial_network_fig,
-                      style={'height': '800px', 'marginTop': '8px', 'borderRadius': '8px', 'overflow': 'hidden'})
-        ], style={"width": "100%", "backgroundColor": "#DBD1B5", "borderRadius": "8px",
-                  "boxShadow": "0 2px 4px rgba(0,0,0,0.15)", "padding": "5px"})
-
-    def _build_dendrogram_section(self, initial_dendro_fig, level_marks):
-        """Typographic Dendrogram panel — font selector, cut-level slider, truncation, drill-down, groups."""
-        dendro_cfg = self.config.get("dendrogram", {})
-        default_level = dendro_cfg.get("default_cut_level", 6)
-        default_p = dendro_cfg.get("default_truncation", 30)
-
-        _font = {'fontSize': '12px', 'fontFamily': 'Inter, Arial, sans-serif'}
-        _label = {'fontSize': '12px', 'fontWeight': '600', 'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}
-
-        section_header = html.Div(
-            html.H3("Typographic Dendrogram",
-                     style={"margin": "0", "fontFamily": "Inter, Arial, sans-serif",
-                            "fontWeight": "600", "letterSpacing": "0.5px", "color": "#887C57"}),
-            style={"textAlign": "center", "padding": "6px 0", "backgroundColor": "#F8F5EC",
-                   "borderRadius": "6px", "marginBottom": "10px",
-                   "boxShadow": "0 1px 2px rgba(0,0,0,0.15)"})
-
-        font_active = {'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
-                       'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
-                       'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
-                       'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
-                       'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}
-        font_inactive = {**font_active, 'backgroundColor': '#DBD1B5', 'color': '#5a5040', 'marginRight': '0'}
-
-        _toggle_base = {'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
-                        'fontFamily': 'Inter, Arial, sans-serif', 'border': 'none', 'borderRadius': '6px',
-                        'cursor': 'pointer', 'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
-                        'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'transition': 'background-color 0.15s ease, transform 0.05s ease',
-                        'lineHeight': '1', 'width': '120px', 'minWidth': '120px'}
-        _active = {**_toggle_base, 'backgroundColor': '#2f4a84', 'color': 'white'}
-        _inactive = {**_toggle_base, 'backgroundColor': '#DBD1B5', 'color': '#5a5040'}
-
-        # Truncation controls: how many leaf-clusters to show
-        n_books = len(self.books)
-        p_marks = {}
-        for v in [10, 20, 30, 50, 100, n_books]:
-            if v <= n_books:
-                p_marks[v] = {'label': str(v) if v < n_books else 'All', 'style': {'fontSize': '10px'}}
-
-        # --- Collapsible user guide ---
-        _help_item = {'marginBottom': '6px', 'lineHeight': '1.45'}
-        _help_bold = {'fontWeight': '600', 'color': '#2f4a84'}
-        help_guide = html.Details([
-            html.Summary("📖 How to use this dendrogram (click to collapse)",
-                         style={'cursor': 'pointer', 'fontWeight': '600', 'fontSize': '12.5px',
-                                'color': '#2f4a84', 'fontFamily': 'Inter, Arial, sans-serif',
-                                'padding': '6px 0', 'userSelect': 'none'}),
-            html.Div([
-                html.P("This dendrogram clusters books by typographic similarity. "
-                       "Books sharing more letter-shapes are linked by shorter branches.",
-                       style={'marginTop': '6px', 'marginBottom': '8px', 'fontSize': '11.5px',
-                              'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}),
-                html.Ul([
-                    html.Li([html.Span("Roman / Italic", style=_help_bold),
-                             " — Switch between similarity matrices computed from roman or italic letterforms."],
-                            style=_help_item),
-                    html.Li([html.Span("Cut Level", style=_help_bold),
-                             " — Controls how groups are formed. A higher threshold means books must share "
-                             "more letter-shapes to belong to the same group, producing fewer, tighter clusters. "
-                             "A lower threshold yields larger, more inclusive groups."],
-                            style=_help_item),
-                    html.Li([html.Span("Detail Level", style=_help_bold),
-                             " — Controls how many leaf nodes are visible. At low values, nearby leaves are "
-                             "collapsed into diamond-shaped cluster nodes showing a book count. Slide right "
-                             "toward \"All\" to see every individual book. Works in both the full tree and "
-                             "drill-down subtrees."],
-                            style=_help_item),
-                    html.Li([html.Span("Click a book (●)", style=_help_bold),
-                             " — Selects that book and adds it to the network graph selection. "
-                             "The book will be highlighted across all views."],
-                            style=_help_item),
-                    html.Li([html.Span("Click a cluster (◆)", style=_help_bold),
-                             " — Drills down into that cluster, showing only its sub-tree. "
-                             "Use the \"← Back to full tree\" button to return to the complete view."],
-                            style=_help_item),
-                    html.Li([html.Span("Search book", style=_help_bold),
-                             " — Type a book name in the search box to instantly drill down into "
-                             "the group that contains it at the current cut level. "
-                             "Clear the search to return to the full tree."],
-                            style=_help_item),
-                    html.Li([html.Span("Hide Singletons", style=_help_bold),
-                             " — Removes books that form their own solitary group (size\u00a0=\u00a01) from the "
-                             "dendrogram entirely, including their branches, so you can focus on the books "
-                             "that cluster together."],
-                            style=_help_item),
-                    html.Li([html.Span("Group cards (below the chart)", style=_help_bold),
-                             " — Each card shows a group's size, its most common printers, and sample book names. "
-                             "Use ", html.Em("Select"), " to add all books in that group to your selection, ",
-                             html.Em("Highlight"), " to visually emphasize them in the dendrogram "
-                             "(click Highlight again to clear), or ",
-                             html.Em("Drill Down"), " to zoom into only that group's sub-tree."],
-                            style=_help_item),
-                    html.Li([html.Span("Branch colors", style=_help_bold),
-                             " — Branches are colored by group membership. A solid-colored branch means all "
-                             "descending books belong to the same group; gray branches span multiple groups."],
-                            style=_help_item),
-                    html.Li([html.Span("Reading the tree", style=_help_bold),
-                             " — The root (leftmost point) splits into branches that end at individual books "
-                             "or clusters on the right. Shorter horizontal distance between two books means "
-                             "higher typographic similarity."],
-                            style=_help_item),
-                ], style={'paddingLeft': '18px', 'margin': '0', 'fontSize': '11.5px',
-                          'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}),
-            ], style={'padding': '4px 10px 8px 10px'}),
-        ], open=True,
-           style={'margin': '0 6px 10px 6px', 'padding': '6px 10px',
-                  'backgroundColor': '#F8F5EC', 'borderRadius': '6px',
-                  'border': '1px solid rgba(47,74,132,0.25)',
-                  'boxShadow': '0 1px 3px rgba(0,0,0,0.08)'})
-
-        return html.Div([
-            section_header,
-            help_guide,
-            # Font selector row
-            html.Div([
-                html.Button("Roman", id='dendro-roman-btn', n_clicks=0, style=font_active),
-                html.Button("Italic", id='dendro-italic-btn', n_clicks=0, style=font_inactive),
-                dcc.Store(id='dendro-font-store', data='roman'),
-                dcc.Store(id='dendro-highlight-store', data=None),
-                # Store: which subtree to drill into (None = full tree, int = linkage node id)
-                dcc.Store(id='dendro-drilldown-store', data=None),
-            ], style={'textAlign': 'center', 'marginBottom': '8px'}),
-            # Controls row: two columns
-            html.Div([
-                # Left column — cut level
-                html.Div([
-                    html.Label('Cut Level (threshold to form groups):', style=_label),
-                    dcc.Slider(id='dendro-level-slider', min=0, max=self.n1hat_levels_max, step=1,
-                               value=default_level, marks=level_marks,
-                               tooltip={"placement": "bottom", "always_visible": False}, className='compact-slider'),
-                ], style={'flex': '1', 'padding': '0 8px'}),
-                # Right column — truncation p
-                html.Div([
-                    html.Label('Detail level (visible clusters):', style=_label),
-                    dcc.Slider(id='dendro-truncation-slider', min=5, max=n_books, step=1,
-                               value=min(default_p, n_books), marks=p_marks,
-                               tooltip={"placement": "bottom", "always_visible": False}, className='compact-slider'),
-                ], style={'flex': '1', 'padding': '0 8px'}),
-            ], style={'display': 'flex', 'padding': '6px 0'}),
-            # Status row: level label + breadcrumb + show/hide buttons
-            html.Div([
-                html.Div(id='dendro-level-label', style={'textAlign': 'center', 'color': '#5a5040', **_font}),
-                html.Div(id='dendro-breadcrumb', children=[
-                    html.Button("← Back to full tree", id='dendro-back-btn', n_clicks=0,
-                                style={'display': 'none'})
-                ], style={'textAlign': 'center', 'marginTop': '4px'}),
-                html.Div([
-                    html.Div([
-                        html.Label('Search book:', style={**_label, 'marginRight': '6px', 'display': 'inline-block', 'verticalAlign': 'middle'}),
-                        dcc.Dropdown(
-                            id='dendro-search-book-dropdown',
-                            options=[{'label': str(b), 'value': str(b)} for b in sorted(self.books)],
-                            placeholder='Type a book name...',
-                            searchable=True,
-                            clearable=True,
-                            style={'width': '350px', 'display': 'inline-block', 'verticalAlign': 'middle',
-                                   'fontSize': '11px', 'fontFamily': 'Inter, Arial, sans-serif'},
-                        ),
-                    ], style={'display': 'inline-flex', 'alignItems': 'center', 'marginRight': '16px'}),
-                    html.Button('Hide Singletons', id='dendro-hide-singletons-btn', n_clicks=0,
-                                 style=_inactive),
-                ], style={'textAlign': 'center', 'marginTop': '8px', 'display': 'flex',
-                          'justifyContent': 'center', 'alignItems': 'center', 'flexWrap': 'wrap', 'gap': '6px'}),
-                dcc.Store(id='dendro-hide-singletons', data=False),
-            ], style={'padding': '4px 12px'}),
-            # Graph — dynamic height set by callback
-            dcc.Graph(id='dendrogram-graph', figure=initial_dendro_fig,
-                      style={'marginTop': '8px', 'borderRadius': '8px', 'overflow': 'hidden'}),
-            # Group summaries
-            html.Div(id='dendro-groups-container',
-                      style={'marginTop': '10px', 'maxHeight': '300px', 'overflowY': 'auto',
-                             'padding': '8px', 'backgroundColor': '#F8F5EC', 'borderRadius': '6px'}),
-        ], style={'marginTop': '20px', 'padding': '10px', 'backgroundColor': '#DBD1B5',
-                  'borderRadius': '8px', 'boxShadow': '0 2px 4px rgba(0,0,0,0.15)'})
-
-    def _build_export_section(self):
-        """Export controls and download component."""
-        return html.Div([
-            html.Div(
-                html.H3("Export",
-                         style={"margin": "0", "fontFamily": "Inter, Arial, sans-serif",
-                                "fontWeight": "600", "letterSpacing": "0.5px", "color": "#887C57"}),
-                style={"textAlign": "center", "padding": "6px 0", "backgroundColor": "#F8F5EC",
-                       "borderRadius": "6px", "marginBottom": "10px",
-                       "boxShadow": "0 1px 2px rgba(0,0,0,0.15)"}),
-            html.Div([
-                html.Button("Download HTML", id="export-html-btn", n_clicks=0,
-                             style={'padding': '10px 20px', 'backgroundColor': '#2f4a84', 'color': 'white',
-                                    'border': 'none', 'borderRadius': '6px', 'fontSize': '13px',
-                                    'cursor': 'pointer', 'fontWeight': '500', 'fontFamily': 'Inter, Arial, sans-serif',
-                                    'boxShadow': '0 1px 3px rgba(0,0,0,0.2)'}),
-            ], style={'textAlign': 'center'}),
-            html.Div(id="export-status",
-                      style={'textAlign': 'center', 'marginTop': '10px', 'fontFamily': 'Inter, Arial, sans-serif',
-                             'color': '#5a5040'})
-        ], style={'marginTop': '20px', 'padding': '10px', 'backgroundColor': '#DBD1B5',
-                  'borderRadius': '8px', 'boxShadow': '0 2px 4px rgba(0,0,0,0.15)'})
-
-    # ------------------------------------------------------------------
-    # Layout compositor
-    # ------------------------------------------------------------------
-
     def _setup_layout(self, w_rm=None, w_it=None):
-        """Compose the dashboard layout from sub-method components."""
-        # Load cached UMAP positions (do NOT compute at startup)
-        initial_umap = self._load_umap_positions(font_type='combined', w_rm=w_rm, w_it=w_it, compute_if_missing=False)
+        """Setup the dashboard layout"""
+        
+        # Load UMAP for store initialization (figures created on first callback for memory efficiency).
+        # Do NOT compute missing UMAP at startup; only load cached combined positions if present.
+        initial_umap = self._load_umap_positions(font_type='combined', w_rm=w_rm, w_it=w_it, n_neighbors=50, min_dist=0.5, compute_if_missing=False)
         initial_umap_list = initial_umap.tolist() if initial_umap is not None else None
         print("UMAP positions loaded (if cached), figures will be created on first render")
-
-        # Empty placeholder figures (actual content created on first callback)
+        
+        # Create empty placeholder figures (actual figures created in callback to save memory)
         initial_network_fig = go.Figure()
         initial_heatmap_fig = go.Figure()
-        initial_dendro_fig = go.Figure()
-
-        # Dendrogram slider marks
+        initial_dendro_fig = go.Figure()  # placeholder for Typographic Dendrogram
+        # Slider marks for dendrogram levels (spread across range)
         try:
             step = max(1, self.n1hat_levels_max // 6)
             level_marks = {i: {'label': str(i)} for i in range(0, self.n1hat_levels_max + 1, step)}
         except Exception:
             level_marks = {0: {'label': '0'}, 6: {'label': '6'}}
+        self.app.layout = html.Div([            
+            # Modern page title
+            html.Div([
+                html.H1("Theatre Chapbooks At Scale", 
+                       style={'textAlign': 'center', 'margin': '0', 'fontFamily': 'Inter, Arial, sans-serif', 
+                              'fontWeight': '700', 'fontSize': '2.2rem', 'color': '#374151',
+                              'letterSpacing': '-0.5px'}),
+                html.P("A Statistical Comparative Analysis of Typography",
+                       style={'textAlign': 'center', 'margin': '5px 0 0 0', 'fontFamily': 'Inter, Arial, sans-serif',
+                              'fontWeight': '400', 'fontSize': '1rem', 'color': '#887C57',
+                              'letterSpacing': '0.5px'}),
+            ], style={'marginBottom': '20px', 'padding': '20px 0'}),
+            
+            # Control panel - Font Type selector (centered, button style)
+            html.Div([
+                # Row container
+                html.Div([
 
-        self.app.layout = html.Div([
-            self._build_page_header(),
-            self._build_font_selector(),
-            *self._build_data_stores(initial_umap_list),
-            self._build_heatmap_and_comparison(initial_heatmap_fig),
-            self._build_network_section(initial_network_fig),
-            self._build_dendrogram_section(initial_dendro_fig, level_marks),
-            self._build_export_section(),
-            dcc.Download(id="download-html"),
+                    # Label (absolutely positioned)
+                    html.Div(
+                        html.Label(
+                            "Font type",
+                            style={
+                                'fontSize': '13px',
+                                'fontWeight': '600',
+                                'color': '#887C57',
+                                'fontFamily': 'Inter, Arial, sans-serif'
+                            }
+                        ),
+                        style={'position': 'absolute', 'left': '20px', 'top': '50%', 'transform': 'translateY(-50%)'}
+                    ),
+
+                    # Button group (centered in full width)
+                    html.Div([
+                        html.Button("Combined", id='font-combined-btn', n_clicks=0,
+                                    style={'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                        'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                        'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+
+                        html.Button("Roman", id='font-roman-btn', n_clicks=0,
+                                    style={'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                        'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                        'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+
+                        html.Button("Italic", id='font-italic-btn', n_clicks=0,
+                                    style={'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                        'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                        'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+                    ], style={
+                        'display': 'flex',
+                        'justifyContent': 'center',
+                        'width': '100%'
+                    }),
+
+                    dcc.Store(id='font-type-store', data='combined'),
+
+                ], style={
+                    'position': 'relative',
+                    'display': 'flex',
+                    'alignItems': 'center',
+                    'justifyContent': 'center'
+                })
+            ],
+            style={
+                'marginBottom': '15px',
+                'padding': '12px 20px',
+                'backgroundColor': '#DBD1B5',
+                'borderRadius': '8px',
+                'boxShadow': '0 2px 4px rgba(0,0,0,0.15)'
+            }),
+
+            
+            # Store for UMAP positions cache - initialize with loaded positions
+            dcc.Store(id='umap-positions-store', data=initial_umap_list),
+            
+            # Store for selected books in network graph
+            dcc.Store(id='network-selected-books-store', data=[]),
+            # Store to persist whether selected books traces are shown (True) or hidden ('legendonly'/False)
+            dcc.Store(id='network-selected-books-visibility-store', data=False),
+
+            # Persist legend visibility across updates (mapping trace name -> True or 'legendonly')
+            dcc.Store(id='network-legend-visibility-store', data={}),
+            dcc.Store(id='heatmap-legend-visibility-store', data={}),
+            
+            # Main content with letter comparison panel - styled container like network graph
+            html.Div([
+                # Section header
+                html.Div(
+                    html.H3(
+                        "Typographic Similarity Analysis",
+                        style={
+                            "margin": "0",
+                            "fontFamily": "Inter, Arial, sans-serif",
+                            "fontWeight": "600",
+                            "letterSpacing": "0.5px",
+                            "color": "#887C57",
+                        },
+                    ),
+                    style={
+                        "textAlign": "center",
+                        "padding": "6px 0",
+                        "backgroundColor": "#F8F5EC",
+                        "borderRadius": "6px",
+                        "marginBottom": "10px",
+                        "boxShadow": "0 1px 2px rgba(0,0,0,0.15)",
+                    },
+                ),
+                # Content row: matrix + letter comparison
+                html.Div([
+                    # Similarity matrix - left side (45%)
+                    html.Div([
+                        html.Div(
+                            "Similarity Matrix",
+                            style={
+                                'textAlign': 'center',
+                                'marginBottom': '8px',
+                                'fontFamily': 'Inter, Arial, sans-serif',
+                                'fontWeight': '600',
+                                'fontSize': '13px',
+                                'color': '#887C57'
+                            }
+                        ),
+                        # Buttons to toggle all printer overlays
+                        html.Div([
+                            html.Button("Hide Printers", id='hide-all-printers-btn', n_clicks=0,
+                                    style={'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                        'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                        'width': '110px', 'minWidth': '110px'}),
+                            html.Button("Show Printers", id='show-all-printers-btn', n_clicks=0,
+                                    style={'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                        'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                        'width': '110px', 'minWidth': '110px'}),
+                        ], style={'marginBottom': '8px', 'textAlign': 'center'}),
+                        dcc.Graph(id='similarity-heatmap', figure=initial_heatmap_fig, 
+                                  style={'width': '100%', 'aspectRatio': '1 / 1', 'borderRadius': '8px', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)s', "margin": "0 auto"},
+                                  config={'responsive': True})
+                    ], style={'flex': '1 1 45%', 'minWidth': '0', 'maxWidth': '48%', 'boxSizing': 'border-box', 'backgroundColor': '#F8F5EC', 'borderRadius': '8px', 'padding': '2px', 'overflow': 'hidden'}),
+                    
+                    # Letter comparison panel - right side (45%)
+                    html.Div([
+                        html.Div(
+                            "Letter Comparison",
+                            style={
+                                'textAlign': 'center',
+                                'marginBottom': '8px',
+                                'fontFamily': 'Inter, Arial, sans-serif',
+                                'fontWeight': '600',
+                                'fontSize': '13px',
+                                'color': '#887C57'
+                            }
+                        ),
+                        
+                        # Printer filter
+                        html.Div([
+                            html.Label("Filter by printer: ", style={'fontWeight': '500', 'marginRight': '10px', 'fontSize': '11px', 'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}),
+                            dcc.Dropdown(
+                                id='printer-filter-dropdown',
+                                options=[],  # Will be populated
+                                value=None,
+                                multi=False,
+                                placeholder='All printers',
+                                clearable=True,
+                                style={'width': '100%', 'fontSize': '11px'}
+                            ),
+                            html.Button("Select all from this printer", id='select-all-printer-books-btn', n_clicks=0,
+                                       style={'marginTop': '5px', 'padding': '6px 12px', 'fontSize': '11px', 'fontWeight': '500',
+                                              'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                              'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'none',
+                                              'boxShadow': '0 1px 3px rgba(0,0,0,0.2)'}),
+                        ], style={'marginBottom': '8px', 'padding': '8px', 'backgroundColor': '#DBD1B5', 'borderRadius': '6px'}),
+                        
+                        # Book selector for multi-book comparison
+                        html.Div([
+                            html.Label("Select books: ", style={'fontWeight': '500', 'marginRight': '10px', 'fontSize': '11px', 'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}),
+                            html.Button("Clear", id='clear-comparison-btn', n_clicks=0, 
+                                       style={'float': 'right', 'padding': '4px 10px', 'fontSize': '10px', 'fontWeight': '500',
+                                              'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                              'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                              'boxShadow': '0 1px 3px rgba(0,0,0,0.2)'}),
+                            dcc.Dropdown(
+                                id='additional-books-dropdown',
+                                options=[],  # Will be populated
+                                value=[],
+                                multi=True,
+                                placeholder='+ Click matrix or select books here...',
+                                style={'width': '100%', 'fontSize': '11px'}
+                            ),
+                            # Store to track clicked books from matrix
+                            dcc.Store(id='clicked-books-store', data=[]),
+                        ], style={'marginBottom': '8px', 'padding': '8px', 'backgroundColor': '#DBD1B5', 'borderRadius': '6px'}),
+                        
+                        # Letter filter - now inside comparison panel
+                        html.Div([
+                            html.Label("Filter: ", style={'fontWeight': '500', 'marginRight': '5px', 'fontSize': '11px', 'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}),
+                            html.Button("All", id='select-all-letters', n_clicks=0, 
+                                       style={'marginRight': '3px', 'padding': '4px 8px', 'fontSize': '10px', 'fontWeight': '500',
+                                              'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                              'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
+                            html.Button("None", id='select-no-letters', n_clicks=0, 
+                                       style={'marginRight': '8px', 'padding': '4px 8px', 'fontSize': '10px', 'fontWeight': '500',
+                                              'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                              'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
+                            html.Button("a-z", id='select-lowercase', n_clicks=0, 
+                                       style={'marginRight': '3px', 'padding': '4px 8px', 'fontSize': '10px', 'fontWeight': '500',
+                                              'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                              'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
+                            html.Button("A-Z", id='select-uppercase', n_clicks=0, 
+                                       style={'marginRight': '8px', 'padding': '4px 8px', 'fontSize': '10px', 'fontWeight': '500',
+                                              'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                              'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
+                            dcc.Checklist(
+                                id='letter-filter',
+                                options=[],
+                                value=[],
+                                inline=True,
+                                style={'display': 'inline-block', 'fontSize': '11px'},
+                                inputStyle={'marginRight': '2px', 'marginLeft': '6px'}
+                            )
+                        ], style={'marginBottom': '8px', 'padding': '8px', 'backgroundColor': '#DBD1B5', 'borderRadius': '6px'}),
+                        
+                        html.Div(id='letter-comparison-panel', 
+                                style={
+                                    'border': '1px solid #d1c7ad', 
+                                    'borderRadius': '6px',
+                                    'padding': '15px',
+                                    'backgroundColor': '#F8F5EC',
+                                    'minHeight': '500px',
+                                    'maxHeight': '800px',
+                                    'overflowY': 'auto'
+                                },
+                                children=[
+                                    html.P("Click on a cell in the similarity matrix or a node in the network graph", 
+                                          style={'textAlign': 'center', 'color': '#6b7280', 'marginTop': '200px', 'fontSize': '13px', 'fontFamily': 'Inter, Arial, sans-serif'})
+                                ])
+                    ], style={'flex': '1 1 45%', 'minWidth': '0', 'maxWidth': '48%', 'boxSizing': 'border-box', 'backgroundColor': '#F8F5EC', 'borderRadius': '8px', 'padding': '10px', 'overflow': 'hidden'})
+                ], style={'display': 'flex', 'gap': '2%', 'alignItems': 'flex-start', 'justifyContent': 'space-between'}),
+            ], style={
+                "width": "100%",
+                "backgroundColor": "#DBD1B5",
+                "borderRadius": "8px",
+                "boxShadow": "0 2px 4px rgba(0,0,0,0.15)",
+                "padding": "10px",
+                "marginBottom": "20px"
+            }),
+                
+                # Network graph section with controls
+            html.Div([
+                html.Div(
+                    html.H3(
+                        "Graph of Typographic Similarity",
+                        style={
+                            "margin": "0",
+                            "fontFamily": "Inter, Arial, sans-serif",
+                            "fontWeight": "600",
+                            "letterSpacing": "0.5px",
+                            "color": "#887C57",
+                        },
+                    ),
+                    style={
+                        "textAlign": "center",
+                        "padding": "6px 0",
+                        "backgroundColor": "#F8F5EC",
+                        "borderRadius": "6px",
+                        "marginBottom": "10px",
+                        "boxShadow": "0 1px 2px rgba(0,0,0,0.15)",
+                    },
+                ),
+                # Store for UMAP position source (buttons moved into controls row column 3)
+                dcc.Store(id='umap-pos-source-store', data='combined'),
+
+                # Network graph controls row - 3 columns with fixed 30% width each
+                html.Div([
+                    # Column 1: Hide/Show buttons (30% width, centered content)
+                    html.Div([
+                        html.Div([
+                            html.Button("Hide Labels", id='hide-all-labels-btn', n_clicks=0,
+                                           style={'marginRight': '5px', 'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Button("Show Labels", id='show-all-labels-btn', n_clicks=0,
+                                           style={'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Br(),
+                                html.Button("Hide Markers", id='hide-all-markers-btn', n_clicks=0,
+                                           style={'marginRight': '5px', 'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Button("Show Markers", id='show-all-markers-btn', n_clicks=0,
+                                           style={'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Br(),
+                                html.Button("Hide Printers", id='hide-all-network-printers-btn', n_clicks=0,
+                                           style={'marginRight': '5px', 'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Button("Show Printers", id='show-all-network-printers-btn', n_clicks=0,
+                                           style={'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Br(),
+                                html.Button("Hide Selected", id='hide-selected-books-btn', n_clicks=0,
+                                           style={'marginRight': '5px', 'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                                html.Button("Show Selected", id='show-selected-books-btn', n_clicks=0,
+                                           style={'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                  'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                                  'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                                  'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                                  'width': '120px', 'minWidth': '120px'}),
+                            ], style={'display': 'inline-block', 'textAlign': 'center'})
+                        ], style={'width': '30%', 'flexShrink': '0', 'flexGrow': '0', 'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center'}),
+                        
+                        # Column 2: Sliders stacked vertically (30% width, centered content)
+                        html.Div([
+                            html.Div([
+                                html.Div([
+                                    html.Label("Edge Opacity:", style={
+                                        'fontSize': '11px',
+                                        'fontWeight': '500',
+                                        'color': 'dimgray',
+                                        'fontFamily': 'Inter, Arial, sans-serif',
+                                        'marginBottom': '2px'   # 👈 tighten label spacing
+                                    }),
+                                    dcc.Slider(
+                                        id='edge-opacity-slider',
+                                        min=0,
+                                        max=2,
+                                        step=0.1,
+                                        value=1,
+                                        marks={
+                                            0: {'label': '0', 'style': {'fontSize': '10px'}},
+                                            1: {'label': '1', 'style': {'fontSize': '10px'}},
+                                            2: {'label': '2', 'style': {'fontSize': '10px'}}
+                                        },
+                                        tooltip={"placement": "bottom", "always_visible": False},
+                                        className="compact-slider"
+                                    )
+                                ], style={'marginBottom': '-10px'}),   # 👈 reduce gap between blocks
+
+                                html.Div([
+                                    html.Label("Node Size:", style={
+                                        'fontSize': '11px',
+                                        'fontWeight': '500',
+                                        'color': 'dimgray',
+                                        'fontFamily': 'Inter, Arial, sans-serif',
+                                        'marginBottom': '2px'
+                                    }),
+                                    dcc.Slider(
+                                        id='node-size-slider',
+                                        min=6,
+                                        max=24,
+                                        step=1,
+                                        value=12,
+                                        marks={
+                                            6: {'label': '6', 'style': {'fontSize': '10px'}},
+                                            15: {'label': '15', 'style': {'fontSize': '10px'}},
+                                            24: {'label': '24', 'style': {'fontSize': '10px'}}
+                                        },
+                                        tooltip={"placement": "bottom", "always_visible": False},
+                                        className="compact-slider"
+                                    ),
+                                ], style={'marginBottom': '-10px'}),
+
+                                html.Div([
+                                    html.Label("Label Size:", style={
+                                        'fontSize': '11px',
+                                        'fontWeight': '500',
+                                        'color': 'dimgray',
+                                        'fontFamily': 'Inter, Arial, sans-serif',
+                                        'marginBottom': '2px'
+                                    }),
+                                    dcc.Slider(
+                                        id='label-size-slider',
+                                        min=6,
+                                        max=24,
+                                        step=1,
+                                        value=8,
+                                        marks={
+                                            6: {'label': '6', 'style': {'fontSize': '10px'}},
+                                            15: {'label': '15', 'style': {'fontSize': '10px'}},
+                                            24: {'label': '24', 'style': {'fontSize': '10px'}}
+                                        },
+                                        tooltip={"placement": "bottom", "always_visible": False},
+                                        className="compact-slider"
+                                    ),
+                                ]),
+                            ], style={'width': '85%'})
+                        ], style={
+                            'width': '30%',
+                            'flexShrink': '0',
+                            'flexGrow': '0',
+                            'display': 'flex',
+                            'flexDirection': 'column',
+                            'justifyContent': 'center'
+                        }),
+
+                        # Column 3: Node positions source (30% width)
+                        html.Div([
+                            html.Div([
+                                html.Div("Node positions source", style={'fontWeight': '600', 'fontSize': '11px', 'color': '#887C57', 'marginBottom': '8px', 'textAlign': 'center', 'fontFamily': 'Inter, Arial, sans-serif'}),
+                                html.Div([
+                                    html.Button("Combined", id='umap-pos-combined-btn', n_clicks=0,
+                                                style={'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                       'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                                       'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                                       'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                                       'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+                                    html.Button("Roman", id='umap-pos-roman-btn', n_clicks=0,
+                                                style={'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                       'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                                       'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                                       'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                                       'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+                                    html.Button("Italic", id='umap-pos-italic-btn', n_clicks=0,
+                                                style={'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                                       'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                                       'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                                       'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                                       'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+                                ], style={'display': 'flex', 'justifyContent': 'center', 'gap': '2px'})
+                            ], style={'backgroundColor': '#DBD1B5', 'borderRadius': '8px', 'padding': '8px 10px', 'width': '100%'})
+                        ], style={'width': '30%', 'flexShrink': '0', 'flexGrow': '0', 'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center', }),
+                ], style={'marginBottom': '5px', 'padding': '10px', 'backgroundColor': "#DBD1B5", 'borderRadius': '8px', 'display': 'flex', 'flexWrap': 'nowrap', 'alignItems': 'stretch', 'justifyContent': 'space-between'}),
+                
+                dcc.Graph(id='network-graph', figure=initial_network_fig, style={'height': '800px', 'marginTop': '8px', 'borderRadius': '8px', 'overflow': 'hidden'})
+            ], style={
+                "width": "100%",
+                "backgroundColor": "#DBD1B5",
+                "borderRadius": "8px",
+                "boxShadow": "0 2px 4px rgba(0,0,0,0.15)",
+                "padding": "5px",
+            }),
+                        
+            # Typographic Dendrogram section - same theme
+            html.Div([
+                html.Div(
+                    html.H3(
+                        "Typographic Dendrogram",
+                        style={
+                            "margin": "0",
+                            "fontFamily": "Inter, Arial, sans-serif",
+                            "fontWeight": "600",
+                            "letterSpacing": "0.5px",
+                            "color": "#887C57",
+                        },
+                    ),
+                    style={
+                        "textAlign": "center",
+                        "padding": "6px 0",
+                        "backgroundColor": "#F8F5EC",
+                        "borderRadius": "6px",
+                        "marginBottom": "10px",
+                        "boxShadow": "0 1px 2px rgba(0,0,0,0.15)",
+                    },
+                ),
+
+                # Font selector for dendrogram (Roman / Italic)
+                html.Div([
+                    html.Button("Roman", id='dendro-roman-btn', n_clicks=0,
+                                style={'marginRight': '5px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                       'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                       'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                       'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                       'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+                    html.Button("Italic", id='dendro-italic-btn', n_clicks=0,
+                                style={'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                       'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                       'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+                                       'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+                                       'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'width': '100px'}),
+                    dcc.Store(id='dendro-font-store', data='roman'), dcc.Store(id='dendro-highlight-store', data=None)
+                ], style={'textAlign': 'center', 'marginBottom': '8px'}),
+
+                html.Div([
+                    html.Label('Cut Level (choose threshold to form groups):', style={'fontSize': '12px', 'fontWeight': '600', 'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}),
+                    dcc.Slider(
+                        id='dendro-level-slider',
+                        min=0,
+                        max=self.n1hat_levels_max,
+                        step=1,
+                        value=6,
+                        marks=level_marks,
+                        tooltip={"placement": "bottom", "always_visible": False},
+                        className='compact-slider'
+                    ),
+                    html.Div(id='dendro-level-label', style={'textAlign': 'center', 'marginTop': '6px', 'color': '#5a5040'}),
+
+                    # Show/Hide selected books controls
+                    html.Div([
+                        html.Button('Hide Selected', id='dendro-hide-selected-btn', n_clicks=0,
+                                   style={'marginRight': '5px', 'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                          'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                          'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                          'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                          'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                          'width': '120px', 'minWidth': '120px'}),
+                        html.Button('Show Selected', id='dendro-show-selected-btn', n_clicks=0,
+                                   style={'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+                                          'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                          'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                          'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                          'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+                                          'width': '120px', 'minWidth': '120px'}),
+                    ], style={'textAlign':'center', 'marginTop':'8px'}),
+                    dcc.Store(id='dendro-show-selected', data=False)
+                ], style={'padding': '6px 12px'}),
+
+                dcc.Graph(id='dendrogram-graph', figure=initial_dendro_fig, style={'height': '420px', 'marginTop': '8px', 'borderRadius': '8px', 'overflow': 'hidden'}),
+
+                # Container for group summaries (updated by callback)
+                html.Div(id='dendro-groups-container', style={'marginTop': '10px', 'maxHeight': '240px', 'overflowY': 'auto', 'padding': '8px', 'backgroundColor': '#F8F5EC', 'borderRadius': '6px'}),
+            ], style={
+                'marginTop': '20px', 'padding': '10px', 'backgroundColor': '#DBD1B5', 'borderRadius': '8px',
+                'boxShadow': '0 2px 4px rgba(0,0,0,0.15)'
+            }),
+
+            # Export section - matching theme
+            html.Div([
+                html.Div(
+                    html.H3(
+                        "Export",
+                        style={
+                            "margin": "0",
+                            "fontFamily": "Inter, Arial, sans-serif",
+                            "fontWeight": "600",
+                            "letterSpacing": "0.5px",
+                            "color": "#887C57",
+                        },
+                    ),
+                    style={
+                        "textAlign": "center",
+                        "padding": "6px 0",
+                        "backgroundColor": "#F8F5EC",
+                        "borderRadius": "6px",
+                        "marginBottom": "10px",
+                        "boxShadow": "0 1px 2px rgba(0,0,0,0.15)",
+                    },
+                ),
+                html.Div([
+                    html.Button("Download HTML", id="export-html-btn", n_clicks=0,
+                               style={'padding': '10px 20px', 'backgroundColor': '#2f4a84', 'color': 'white', 
+                                      'border': 'none', 'borderRadius': '6px', 'fontSize': '13px', 
+                                      'cursor': 'pointer', 'fontWeight': '500', 'fontFamily': 'Inter, Arial, sans-serif',
+                                      'boxShadow': '0 1px 3px rgba(0,0,0,0.2)'}),
+                ], style={'textAlign': 'center'}),
+                html.Div(id="export-status", style={'textAlign': 'center', 'marginTop': '10px', 'fontFamily': 'Inter, Arial, sans-serif', 'color': '#5a5040'})
+            ], style={'marginTop': '20px', 'padding': '10px', 'backgroundColor': '#DBD1B5', 'borderRadius': '8px',
+                      'boxShadow': '0 2px 4px rgba(0,0,0,0.15)'}),
+            
+            # Download component for HTML export
+            dcc.Download(id="download-html")
         ])
     
-    def _register_font_callbacks(self):
-        """Font type toggle (Combined/Roman/Italic)."""
+    def _setup_callbacks(self):
+        """Setup dashboard callbacks"""
         
         # Font type button callback - updates store and button styles
         @self.app.callback(
@@ -1630,9 +1719,6 @@ class BookSimilarityDashboard:
             
             return dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
-    def _register_dendrogram_callbacks(self):
-        """Dendrogram: font selector, figure, book/group selection, highlight, show/hide."""
-
         # Dendrogram font selector callback (Roman / Italic buttons)
         @self.app.callback(
             [Output('dendro-font-store', 'data'),
@@ -1666,17 +1752,11 @@ class BookSimilarityDashboard:
         # Update dendrogram figure and level label based on selected level and font
         @self.app.callback(
             [Output('dendrogram-graph', 'figure'), Output('dendro-level-label', 'children'), Output('dendro-groups-container', 'children'),
-             Output('dendro-level-slider', 'max'), Output('dendro-level-slider', 'marks'),
-             Output('dendro-breadcrumb', 'children')],
-            [Input('dendro-level-slider', 'value'), Input('dendro-font-store', 'data'), Input('dendro-highlight-store', 'data'),
-             Input('dendro-truncation-slider', 'value'), Input('dendro-drilldown-store', 'data'),
-             Input('dendro-hide-singletons', 'data')]
+             Output('dendro-level-slider', 'max'), Output('dendro-level-slider', 'marks')],
+            [Input('dendro-level-slider', 'value'), Input('dendro-font-store', 'data'), Input('dendro-highlight-store', 'data'), Input('dendro-show-selected', 'data'), Input('network-selected-books-store', 'data')]
         )
-        def update_dendrogram_figure(level, font, highlight_label, truncation_p, drilldown_node, hide_singletons):
+        def update_dendrogram_figure(level, font, highlight_label, show_selected, selected_books):
             try:
-                import plotly.express as px
-                import plotly.graph_objects as go
-
                 # Choose the n1hat matrix
                 if font == 'italic':
                     n1hat = self.n1hat_it
@@ -1685,28 +1765,24 @@ class BookSimilarityDashboard:
                 else:
                     n1hat = self.n1hat_rm + self.n1hat_it
 
-                # Dynamic slider max & marks
+                # Compute dynamic slider max & marks from the selected n1hat
                 slider_max = int(np.max(n1hat))
                 slider_step = max(1, slider_max // 6)
                 slider_marks = {i: {'label': str(i)} for i in range(0, slider_max + 1, slider_step)}
 
-                # Connected components at threshold
+                # Connected components at threshold (n1hat >= level)
                 adj = (n1hat >= level).astype(int)
                 np.fill_diagonal(adj, 0)
-                G_sparse = csr_matrix(adj)
-                n_comp, labels = connected_components(G_sparse, directed=False)
+                G = csr_matrix(adj)
+                n_comp, labels = connected_components(G, directed=False)
 
-                # Color palette & mapping
+                # Build color mapping for components
+                import plotly.express as px
                 palette = px.colors.qualitative.Dark24 + px.colors.qualitative.Safe + px.colors.qualitative.Vivid
                 unique_labels = np.unique(labels)
                 color_map = {int(l): palette[i % len(palette)] for i, l in enumerate(unique_labels)}
 
-                # Group size info for rank labels
-                _grp_sizes = {int(l): int(np.sum(labels == l)) for l in unique_labels}
-                _sorted_labels = sorted(_grp_sizes.keys(), key=lambda x: -_grp_sizes[x])
-                _label_to_rank = {l: (i + 1) for i, l in enumerate(_sorted_labels)}
-
-                # Validate highlight_label
+                # Validate highlight_label: only honor it if it matches an existing component label
                 try:
                     if highlight_label is not None:
                         h_try = int(highlight_label)
@@ -1715,7 +1791,7 @@ class BookSimilarityDashboard:
                 except Exception:
                     highlight_label = None
 
-                # Prepare linkage
+                # Prepare linkage (use precomputed if available)
                 lk = None
                 if font == 'italic':
                     lk = self.n1hat_linkage_it
@@ -1723,345 +1799,94 @@ class BookSimilarityDashboard:
                     lk = self.n1hat_linkage_rm
                 else:
                     lk = self.n1hat_linkage_combined
+
                 if lk is None:
+                    # compute linkage on demand
                     maxv = float(np.max(n1hat))
                     dist = maxv - n1hat.astype(float)
                     np.fill_diagonal(dist, 0.0)
                     lk = scipy_linkage(squareform(dist), method='single')
 
-                # --- Truncation & drill-down ---
-                n_total = len(self.books)
-                truncation_p = truncation_p or n_total
-                use_truncation = truncation_p < n_total
-
-                # If drilling into a specific subtree, build a sub-linkage
-                breadcrumb = []
-                active_lk = lk
-                active_n = n_total
-                # Mapping from sub-leaf index back to original book index
-                sub_leaf_map = None  # None means identity (full tree)
-
-                if drilldown_node is not None:
-                    try:
-                        # drilldown_node can be:
-                        # - a list of original book indices (from group drill-down)
-                        # - an int or string int (linkage node ID from cluster click)
-                        if isinstance(drilldown_node, list):
-                            sub_leaves = sorted(int(x) for x in drilldown_node)
-                        else:
-                            node_id = int(drilldown_node)
-                            sub_leaves = self._get_linkage_subtree_leaves(lk, node_id, n_total)
-                        if sub_leaves and len(sub_leaves) > 2:
-                            sub_leaf_map = sorted(sub_leaves)
-                            sub_n = len(sub_leaf_map)
-                            # Build sub-distance matrix
-                            maxv = float(np.max(n1hat))
-                            full_dist = maxv - n1hat.astype(float)
-                            np.fill_diagonal(full_dist, 0.0)
-                            sub_dist = full_dist[np.ix_(sub_leaf_map, sub_leaf_map)]
-                            active_lk = scipy_linkage(squareform(sub_dist), method='single')
-                            active_n = sub_n
-                            # Recompute labels for sub-tree
-                            sub_n1hat = n1hat[np.ix_(sub_leaf_map, sub_leaf_map)]
-                            sub_adj = (sub_n1hat >= level).astype(int)
-                            np.fill_diagonal(sub_adj, 0)
-                            _, sub_labels = connected_components(csr_matrix(sub_adj), directed=False)
-                            # Override labels/unique_labels/color_map for sub-tree
-                            labels = np.zeros(n_total, dtype=int)
-                            for si, orig_idx in enumerate(sub_leaf_map):
-                                labels[orig_idx] = sub_labels[si]
-                            unique_labels = np.unique(sub_labels)
-                            color_map = {int(l): palette[i % len(palette)] for i, l in enumerate(unique_labels)}
-                            _grp_sizes = {int(l): int(np.sum(sub_labels == l)) for l in unique_labels}
-                            _sorted_labels = sorted(_grp_sizes.keys(), key=lambda x: -_grp_sizes[x])
-                            _label_to_rank = {l: (i + 1) for i, l in enumerate(_sorted_labels)}
-
-                            breadcrumb.append(
-                                html.Span([
-                                    html.Button("← Back to full tree", id='dendro-back-btn', n_clicks=0,
-                                                style={'padding': '4px 12px', 'fontSize': '11px', 'fontWeight': '500',
-                                                       'fontFamily': 'Inter, Arial, sans-serif',
-                                                       'backgroundColor': '#2f4a84', 'color': 'white',
-                                                       'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
-                                                       'boxShadow': '0 1px 3px rgba(0,0,0,0.2)', 'marginRight': '8px'}),
-                                    html.Span(f"Viewing subtree: {sub_n} books",
-                                              style={'fontSize': '12px', 'color': '#5a5040',
-                                                     'fontFamily': 'Inter, Arial, sans-serif'}),
-                                ])
-                            )
-                        else:
-                            drilldown_node = None
-                    except Exception as e:
-                        import traceback
-                        print(f"Drill-down error: {e}")
-                        print(traceback.format_exc())
-                        drilldown_node = None
-
-                # --- If hiding singletons, rebuild linkage from non-singleton leaves only ---
-                # This ensures branch lines for singletons are removed entirely.
-                def _orig_idx_base(slm, i):
-                    return slm[i] if slm is not None else i
-
-                singleton_leaf_map = None  # maps new sub-index → active-tree leaf index
-                if hide_singletons:
-                    # Identify which active-tree leaves are NOT singletons
-                    if sub_leaf_map is not None:
-                        active_indices = list(range(active_n))
-                    else:
-                        active_indices = list(range(n_total))
-                    non_sing = [i for i in active_indices
-                                if _grp_sizes.get(int(labels[_orig_idx_base(sub_leaf_map, i)]), 1) > 1]
-                    if len(non_sing) >= 2 and len(non_sing) < active_n:
-                        singleton_leaf_map = non_sing
-                        sing_n = len(singleton_leaf_map)
-                        # Build sub-distance matrix for non-singletons
-                        if sub_leaf_map is not None:
-                            orig_indices = [sub_leaf_map[i] for i in singleton_leaf_map]
-                        else:
-                            orig_indices = singleton_leaf_map
-                        maxv2 = float(np.max(n1hat))
-                        full_dist2 = maxv2 - n1hat.astype(float)
-                        np.fill_diagonal(full_dist2, 0.0)
-                        sing_dist = full_dist2[np.ix_(orig_indices, orig_indices)]
-                        active_lk = scipy_linkage(squareform(sing_dist), method='single')
-                        active_n = sing_n
-                        # Update sub_leaf_map to chain: sing index → orig index
-                        sub_leaf_map = orig_indices
-
-                # Build dendrogram from active linkage, with truncation if requested
-                effective_truncation = use_truncation and truncation_p < active_n
-                if effective_truncation:
-                    dend = scipy_dendrogram(active_lk, no_plot=True, truncate_mode='lastp', p=truncation_p)
-                else:
-                    dend = scipy_dendrogram(active_lk, no_plot=True)
-
+                dend = scipy_dendrogram(lk, no_plot=True)
                 icoord = np.array(dend['icoord'])
                 dcoord = np.array(dend['dcoord'])
-                leaves = dend['leaves']
+                leaves = np.array(dend['leaves'])
 
-                # Helper: map a leaf id from the dendrogram back to original book index
-                def _orig_idx(leaf_id):
-                    if sub_leaf_map is not None and leaf_id < active_n:
-                        return sub_leaf_map[leaf_id]
-                    return leaf_id
-
+                # Construct plotly figure from dendrogram coords
+                import plotly.graph_objects as go
                 fig = go.Figure()
+                # Branch lines
+                for xs_line, ys_line in zip(icoord, dcoord):
+                    fig.add_trace(go.Scatter(x=xs_line, y=ys_line, mode='lines', line=dict(color='rgba(60,60,60,0.7)', width=1), hoverinfo='none', showlegend=False))
+                # Leaf markers: place them at x = 5 + 10*i
+                leaf_x = (np.arange(len(leaves)) * 10) + 5
+                leaf_y = np.zeros(len(leaves))
+                leaf_labels = labels[leaves]
+                # Build rank mapping: component labels sorted by group size descending → rank 1, 2, ...
+                _grp_sizes = {int(l): int(np.sum(labels == l)) for l in unique_labels}
+                _sorted_labels = sorted(_grp_sizes.keys(), key=lambda x: -_grp_sizes[x])
+                _label_to_rank = {l: (i + 1) for i, l in enumerate(_sorted_labels)}
+                hover_text = [f"{self.books[int(idx)]} — Group #{_label_to_rank.get(int(g), '?')}" for idx, g in zip(leaves, leaf_labels)]
 
-                # --- HORIZONTAL dendrogram (left-to-right): swap x↔y ---
-                # scipy dendrogram: icoord = leaf positions, dcoord = distances
-                # Horizontal: x = distance (reversed so 0 on right), y = leaf position
+                # If the user asked to show selected books, highlight them using selected_books list
+                try:
+                    selected_set = set(selected_books or [])
+                except Exception:
+                    selected_set = set()
 
-                # Color branches by group membership
-                def _branch_color(xs_orig, ys_orig):
-                    """Determine color for a U-shaped branch."""
-                    leaf_positions = set()
-                    for x_val in [xs_orig[0], xs_orig[3]]:
-                        li = round((x_val - 5) / 10)
-                        if 0 <= li < len(leaves):
-                            leaf_positions.add(li)
-                    if not leaf_positions:
-                        return 'rgba(60,60,60,0.5)'
-                    group_set = set()
-                    for li in leaf_positions:
-                        leaf_id = leaves[li]
-                        if leaf_id < active_n:
-                            oi = _orig_idx(leaf_id)
-                            group_set.add(int(labels[oi]))
-                        else:
-                            orig_leaves_sub = self._get_linkage_subtree_leaves(active_lk, leaf_id, active_n)
-                            if orig_leaves_sub:
-                                for ol in orig_leaves_sub:
-                                    oi = _orig_idx(ol)
-                                    group_set.add(int(labels[oi]))
-                    if len(group_set) == 1:
-                        gid = next(iter(group_set))
-                        c = color_map.get(gid, 'rgba(60,60,60,0.5)')
-                        if c.startswith('#') and len(c) == 7:
-                            r, g, b = int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
-                            return f'rgba({r},{g},{b},0.7)'
-                        return c
-                    return 'rgba(120,120,120,0.4)'
-
-                # Draw branches: swap coords for horizontal layout
-                # Store branch data for potential fading (applied after highlight logic)
-                branch_traces = []
-                branch_leaf_sets = []  # which leaf indices each branch connects to
-                for xs_orig, ys_orig in zip(icoord, dcoord):
-                    bc = _branch_color(xs_orig, ys_orig)
-                    # icoord values → y (leaf space), dcoord values → x (distance)
-                    ys_new = list(xs_orig)
-                    xs_new = list(ys_orig)
-                    # Track which leaf indices this branch touches
-                    branch_leaves = set()
-                    for x_val in [xs_orig[0], xs_orig[3]]:
-                        li = round((x_val - 5) / 10)
-                        if 0 <= li < len(leaves):
-                            leaf_id = leaves[li]
-                            if leaf_id < active_n:
-                                branch_leaves.add(_orig_idx(leaf_id))
-                            else:
-                                sub = self._get_linkage_subtree_leaves(active_lk, leaf_id, active_n)
-                                if sub:
-                                    for ol in sub:
-                                        branch_leaves.add(_orig_idx(ol))
-                    branch_traces.append((xs_new, ys_new, bc))
-                    branch_leaf_sets.append(branch_leaves)
-
-                # --- Leaf markers with rich tooltips ---
-                n_leaves = len(leaves)
-                leaf_y_pos = np.array([(i * 10) + 5 for i in range(n_leaves)])
-                leaf_x_pos = np.zeros(n_leaves)  # leaves at x=0 (distance=0)
-
-                leaf_colors = []
-                leaf_sizes = []
-                leaf_texts = []
-                hover_texts = []
-                leaf_is_cluster = []
-
-                book_to_idx = {str(b): int(i) for i, b in enumerate(self.books)}
-
-                for i, leaf_id in enumerate(leaves):
-                    if leaf_id < active_n:
-                        oi = _orig_idx(leaf_id)
-                        book_name = str(self.books[oi])
-                        grp = int(labels[oi])
-                        rank = _label_to_rank.get(grp, '?')
-                        printer = self.impr_names[oi] if oi < len(self.impr_names) else 'Unknown'
-                        if printer in ['n. nan', 'm. missing']:
-                            printer = 'Unknown'
-                        hover = (f"<b>{book_name}</b><br>"
-                                 f"Printer: {printer}<br>"
-                                 f"Group #{rank} ({_grp_sizes.get(grp, '?')} books)<br>"
-                                 f"<i>Click to select</i>")
-                        hover_texts.append(hover)
-                        leaf_texts.append(book_name)
-                        leaf_colors.append(color_map.get(grp, '#999'))
-                        leaf_sizes.append(8)
-                        leaf_is_cluster.append(False)
+                if show_selected and selected_set:
+                    # Identify book indices for selected names
+                    book_to_idx = {str(b): int(i) for i, b in enumerate(self.books)}
+                    selected_idxs = [book_to_idx[b] for b in selected_set if b in book_to_idx]
+                    if selected_idxs:
+                        leaf_array = np.array(leaves, dtype=int)
+                        mask_sel = np.isin(leaf_array, selected_idxs)
+                        mask_other = ~mask_sel
+                        if np.any(mask_other):
+                            fig.add_trace(go.Scatter(x=leaf_x[np.where(mask_other)], y=leaf_y[np.where(mask_other)], mode='markers', marker=dict(color='rgba(180,180,180,0.25)', size=7, line=dict(color='white', width=1)), text=list(np.array(hover_text)[np.where(mask_other)]), hoverinfo='text', showlegend=False))
+                        if np.any(mask_sel):
+                            # colors correspond to component colors
+                            sel_colors = [color_map[int(l)] for l, m in zip(leaf_labels, mask_sel) if m]
+                            fig.add_trace(go.Scatter(x=leaf_x[np.where(mask_sel)], y=leaf_y[np.where(mask_sel)], mode='markers', marker=dict(color=sel_colors, size=11, line=dict(color='black', width=2)), text=list(np.array(hover_text)[np.where(mask_sel)]), hoverinfo='text', showlegend=False))
                     else:
-                        orig_leaves_sub = self._get_linkage_subtree_leaves(active_lk, leaf_id, active_n)
-                        count = len(orig_leaves_sub) if orig_leaves_sub else 0
-                        grp_counts = {}
-                        for ol in (orig_leaves_sub or []):
-                            oi = _orig_idx(ol)
-                            g = int(labels[oi])
-                            grp_counts[g] = grp_counts.get(g, 0) + 1
-                        if grp_counts:
-                            dominant_grp = max(grp_counts, key=grp_counts.get)
-                            n_groups = len(grp_counts)
-                            dominant_pct = grp_counts[dominant_grp] / count * 100 if count > 0 else 0
-                            rank = _label_to_rank.get(dominant_grp, '?')
-                        else:
-                            dominant_grp = -1
-                            n_groups = 0
-                            dominant_pct = 0
-                            rank = '?'
-                        sample = [str(self.books[_orig_idx(ol)]) for ol in (orig_leaves_sub or [])[:3]]
-                        sample_str = ', '.join(sample)
-                        if count > 3:
-                            sample_str += f', ... (+{count - 3})'
-                        hover = (f"<b>Cluster ({count} books)</b><br>"
-                                 f"Dominant: Group #{rank} ({dominant_pct:.0f}%)"
-                                 + (f" + {n_groups - 1} other group{'s' if n_groups > 2 else ''}" if n_groups > 1 else '')
-                                 + f"<br>{sample_str}<br>"
-                                 f"<i>Click to drill down</i>")
-                        hover_texts.append(hover)
-                        leaf_texts.append(f"({count} books)")
-                        if n_groups == 1:
-                            leaf_colors.append(color_map.get(dominant_grp, '#999'))
-                        else:
-                            leaf_colors.append('#888')
-                        leaf_sizes.append(min(18, max(10, 8 + count // 10)))
-                        leaf_is_cluster.append(True)
-
-                # --- Apply highlight rendering ---
-                # Determine which original book indices should be emphasized
-                if highlight_label is not None:
-                    h = int(highlight_label)
-                    for i, leaf_id in enumerate(leaves):
-                        if leaf_id < active_n:
-                            oi = _orig_idx(leaf_id)
-                            if int(labels[oi]) != h:
-                                leaf_colors[i] = 'rgba(180,180,180,0.25)'
-                                leaf_sizes[i] = 6
-                            else:
-                                leaf_sizes[i] = 10
-                        else:
-                            orig_leaves_sub = self._get_linkage_subtree_leaves(active_lk, leaf_id, active_n)
-                            has_match = any(int(labels[_orig_idx(ol)]) == h for ol in (orig_leaves_sub or []))
-                            if not has_match:
-                                leaf_colors[i] = 'rgba(180,180,180,0.25)'
-                                leaf_sizes[i] = 6
-
-                # --- Add branch traces ---
-                for (xs_new, ys_new, bc), bl_set in zip(branch_traces, branch_leaf_sets):
-                    fig.add_trace(go.Scatter(
-                        x=xs_new, y=ys_new, mode='lines',
-                        line=dict(color=bc, width=1.5),
-                        hoverinfo='none', showlegend=False))
-
-                # Add leaf markers — individual traces for click customdata
-                for i, leaf_id in enumerate(leaves):
-                    is_clust = leaf_is_cluster[i]
-                    if is_clust:
-                        # Encode the original book indices for drill-down
-                        orig_leaves_sub = self._get_linkage_subtree_leaves(active_lk, leaf_id, active_n)
-                        orig_book_idxs = [_orig_idx(ol) for ol in (orig_leaves_sub or [])]
-                        cdata = "cluster_" + ",".join(str(x) for x in orig_book_idxs)
-                    else:
-                        cdata = str(self.books[_orig_idx(leaf_id)])
-                    fig.add_trace(go.Scatter(
-                        x=[leaf_x_pos[i]], y=[leaf_y_pos[i]],
-                        mode='markers+text',
-                        marker=dict(
-                            color=leaf_colors[i],
-                            size=leaf_sizes[i],
-                            symbol='diamond' if is_clust else 'circle',
-                            line=dict(color='white' if not is_clust else '#555', width=1)),
-                        text=[leaf_texts[i]],
-                        textposition='middle right',
-                        textfont=dict(size=9, color='#3b3b3b', family='Inter, Arial, sans-serif'),
-                        hovertemplate=hover_texts[i] + '<extra></extra>',
-                        customdata=[cdata],
-                        showlegend=False,
-                        name=f'leaf_{leaf_id}'
-                    ))
-
-                # Dynamic height based on visible leaves
-                n_visible = len(leaves)
-                fig_height = max(400, n_visible * 18)
-
-                title_text = f"Typographic Dendrogram ({font.capitalize()}) — groups at level ≥ {level}"
-                if effective_truncation:
-                    title_text += f"  ·  showing {n_visible} clusters"
-                if hide_singletons:
-                    title_text += "  ·  singletons hidden"
-
-                fig.update_layout(
-                    title=dict(text=title_text, font=dict(size=13, family='Inter, Arial, sans-serif', color='#5a5040')),
-                    xaxis=dict(title='Linkage distance', showgrid=True, gridcolor='rgba(0,0,0,0.06)',
-                               zeroline=True, zerolinecolor='rgba(0,0,0,0.1)', side='top',
-                               autorange='reversed'),
-                    yaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
-                    height=fig_height,
-                    margin=dict(t=60, b=20, l=40, r=200),
-                    plot_bgcolor='rgba(248,245,236,0.5)',
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    hoverlabel=dict(bgcolor='white', font_size=12, font_family='Inter, Arial, sans-serif'),
-                )
-
-                level_label = f"Groups: {len(unique_labels)} — largest group size: {max(_grp_sizes.values()) if _grp_sizes else 0}"
-
-                # Build group summaries — use the active node set
-                if sub_leaf_map is not None:
-                    active_node_indices = sub_leaf_map
+                        # No matching indices: fallback to normal rendering
+                        leaf_colors = [color_map[int(l)] for l in leaf_labels]
+                        fig.add_trace(go.Scatter(x=leaf_x, y=leaf_y, mode='markers', marker=dict(color=leaf_colors, size=8, line=dict(color='white', width=1)), text=hover_text, hoverinfo='text', showlegend=False))
                 else:
-                    active_node_indices = list(range(n_total))
-                total_nodes = len(active_node_indices)
+                    # If a group is highlighted, gray out others and emphasize group members
+                    if highlight_label is None:
+                        leaf_colors = [color_map[int(l)] for l in leaf_labels]
+                        marker_sizes = [8] * len(leaf_labels)
+                        # single trace for all leaves
+                        fig.add_trace(go.Scatter(x=leaf_x, y=leaf_y, mode='markers', marker=dict(color=leaf_colors, size=marker_sizes, line=dict(color='white', width=1)), text=hover_text, hoverinfo='text', showlegend=False))
+                    else:
+                        try:
+                            h = int(highlight_label)
+                            # indices
+                            leaf_array = np.array(leaf_labels, dtype=int)
+                            mask_h = leaf_array == h
+                            mask_o = ~mask_h
+                            # other nodes (greyed)
+                            if np.any(mask_o):
+                                fig.add_trace(go.Scatter(x=leaf_x[np.where(mask_o)], y=leaf_y[np.where(mask_o)], mode='markers', marker=dict(color='rgba(180,180,180,0.25)', size=7, line=dict(color='white', width=1)), text=list(np.array(hover_text)[np.where(mask_o)]), hoverinfo='text', showlegend=False))
+                            # highlighted nodes
+                            if np.any(mask_h):
+                                fig.add_trace(go.Scatter(x=leaf_x[np.where(mask_h)], y=leaf_y[np.where(mask_h)], mode='markers', marker=dict(color=[color_map[h]]*np.sum(mask_h), size=10, line=dict(color='black', width=2)), text=list(np.array(hover_text)[np.where(mask_h)]), hoverinfo='text', showlegend=False))
+                        except Exception:
+                            leaf_colors = [color_map[int(l)] for l in leaf_labels]
+                            marker_sizes = [8] * len(leaf_labels)
+                            fig.add_trace(go.Scatter(x=leaf_x, y=leaf_y, mode='markers', marker=dict(color=leaf_colors, size=marker_sizes, line=dict(color='white', width=1)), text=hover_text, hoverinfo='text', showlegend=False))
+
+                fig.update_layout(title=f"Typographic Dendrogram ({font.capitalize()}) — groups at level ≥ {level}", xaxis=dict(showticklabels=False), yaxis=dict(title='linkage distance'), height=420, margin=dict(t=40))
+                level_label = f"Groups: {len(unique_labels)} — largest group size: {np.max(np.bincount(labels)) if labels.size>0 else 0}"
+
+                # Build group summaries: sort groups by size descending and show composition by printers
+                total_nodes = labels.size
                 groups = []
                 for lab in unique_labels:
-                    nodes = [idx for idx in active_node_indices if int(labels[idx]) == int(lab)]
-                    size = len(nodes)
+                    nodes = np.where(labels == lab)[0]
+                    size = nodes.size
+                    # exclude unknown/missing when counting printers
                     printers_raw = self.impr_names[nodes]
                     known_mask = ~np.isin(printers_raw, ['n. nan', 'm. missing', 'Unknown'])
                     if np.any(known_mask):
@@ -2070,31 +1895,18 @@ class BookSimilarityDashboard:
                         all_printers = [(str(printers[i]), int(pcounts[i]), float(pcounts[i]) / size) for i in order]
                         printers_unknown = False
                     else:
+                        # only unknown/missing present
                         all_printers = []
                         printers_unknown = True
                     sample_books = [self.books[int(idx)] for idx in nodes[:3]]
-                    groups.append({'label': int(lab), 'size': int(size), 'pct': float(size) / total_nodes,
-                                   'printers': all_printers, 'printers_unknown': printers_unknown,
-                                   'sample_books': sample_books, 'color': color_map.get(int(lab), '#999')})
+                    groups.append({'label': int(lab), 'size': int(size), 'pct': float(size) / total_nodes, 'printers': all_printers, 'printers_unknown': printers_unknown, 'sample_books': sample_books})
+
                 groups.sort(key=lambda x: -x['size'])
 
-                # HTML group summaries
+                # Create HTML children for top groups
                 children = []
-                children.append(html.Div(f"Top groups (level ≥ {level}) — total nodes: {total_nodes}",
-                                         style={'fontWeight': '600', 'color': '#5a5040', 'marginBottom': '6px',
-                                                'fontSize': '12px', 'fontFamily': 'Inter, Arial, sans-serif'}))
-                max_show = min(15, len(groups))
-                btn_style_active = {'marginRight': '5px', 'padding': '4px 10px', 'fontSize': '11px', 'fontWeight': '500',
-                                    'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
-                                    'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
-                                    'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
-                                    'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1'}
-                btn_style_secondary = {'marginRight': '5px', 'padding': '4px 10px', 'fontSize': '11px', 'fontWeight': '500',
-                                       'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
-                                       'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
-                                       'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
-                                       'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1'}
-
+                children.append(html.Div(f"Top groups (level ≥ {level}) — total nodes: {total_nodes}", style={'fontWeight': '600', 'color': '#5a5040', 'marginBottom': '6px', 'fontSize': '12px', 'fontFamily': 'Inter, Arial, sans-serif'}))
+                max_show = min(12, len(groups))
                 for i in range(max_show):
                     g = groups[i]
                     sample_str = ', '.join([str(b) for b in g['sample_books']])
@@ -2104,18 +1916,23 @@ class BookSimilarityDashboard:
                     else:
                         printers_str = ', '.join([f"{p} ({cnt}, {pct*100:.0f}%)" for p, cnt, pct in g['printers']])
                         printers_count_display = str(len(g['printers']))
-
+                    # Buttons: expand (show books/images), select (add books to selection), highlight (show only this group)
+                    btn_style_active = {'marginRight': '5px', 'padding': '4px 10px', 'fontSize': '11px', 'fontWeight': '500',
+                                        'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+                                        'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                        'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                        'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1'}
+                    btn_style_secondary = {'marginRight': '5px', 'padding': '4px 10px', 'fontSize': '11px', 'fontWeight': '500',
+                                           'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+                                           'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+                                           'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+                                           'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1'}
+                    expand_btn = html.Button('Show', id={'type': 'dendro-expand-btn', 'index': g['label']}, n_clicks=0,
+                                             style=btn_style_secondary)
                     select_btn = html.Button('Select', id={'type': 'dendro-select-group-btn', 'index': g['label']}, n_clicks=0,
                                              style=btn_style_active)
                     highlight_btn = html.Button('Highlight', id={'type': 'dendro-highlight-btn', 'index': g['label']}, n_clicks=0,
                                                 style=btn_style_secondary)
-                    drilldown_btn = html.Button('Drill Down', id={'type': 'dendro-drilldown-group-btn', 'index': g['label']}, n_clicks=0,
-                                                style={**btn_style_secondary, 'backgroundColor': '#5a7a3a', 'color': 'white'}) if g['size'] > 2 else None
-                    # Color swatch for group
-                    swatch = html.Span('', style={'display': 'inline-block', 'width': '12px', 'height': '12px',
-                                                   'backgroundColor': g['color'], 'borderRadius': '3px',
-                                                   'marginRight': '6px', 'verticalAlign': 'middle',
-                                                   'border': '1px solid rgba(0,0,0,0.15)'})
 
                     row_style = {'padding': '6px', 'borderBottom': '1px solid #e6e2d6'}
                     try:
@@ -2123,88 +1940,42 @@ class BookSimilarityDashboard:
                             row_style.update({'backgroundColor': '#EAF6FF', 'borderLeft': '3px solid #2f4a84'})
                     except Exception:
                         pass
-
-                    btn_row = [swatch,
-                                  html.Span(f"Group #{i+1}: {g['size']} nodes ({g['pct']*100:.1f}%) — {printers_count_display} printers",
-                                            style={'fontWeight': '600', 'color': '#3b3b3b', 'fontSize': '12px',
-                                                   'fontFamily': 'Inter, Arial, sans-serif'}),
-                                  html.Span(select_btn, style={'marginLeft': '4px'}),
-                                  html.Span(highlight_btn, style={'marginLeft': '4px'})]
-                    if drilldown_btn is not None:
-                        btn_row.append(html.Span(drilldown_btn, style={'marginLeft': '4px'}))
-
                     children.append(html.Div([
-                        html.Div(btn_row),
-                        html.Div(f"Printers: {printers_str}", style={'fontSize': '11px', 'color': '#5a5040',
-                                                                       'fontFamily': 'Inter, Arial, sans-serif',
-                                                                       'marginLeft': '18px'}),
-                        html.Div(f"Sample: {sample_str}", style={'fontSize': '11px', 'color': '#5a5040',
-                                                                    'marginBottom': '6px', 'fontFamily': 'Inter, Arial, sans-serif',
-                                                                    'marginLeft': '18px'}),
-                        html.Div(id={'type': 'dendro-group-content', 'index': g['label']}, children=[], style={'marginTop': '6px'})
+                        html.Div([html.Span(f"Group #{i+1}: {g['size']} nodes ({g['pct']*100:.1f}%) — {printers_count_display} printers", style={'fontWeight': '600', 'color': '#3b3b3b', 'fontSize': '12px', 'fontFamily': 'Inter, Arial, sans-serif'}), html.Span(expand_btn, style={'marginLeft':'8px'}), html.Span(select_btn, style={'marginLeft':'4px'}), html.Span(highlight_btn, style={'marginLeft':'4px'})]),
+                        html.Div(f"Printers: {printers_str}", style={'fontSize': '11px', 'color': '#5a5040', 'fontFamily': 'Inter, Arial, sans-serif'}),
+                        html.Div(f"Sample books: {sample_str}", style={'fontSize': '11px', 'color': '#5a5040', 'marginBottom': '6px', 'fontFamily': 'Inter, Arial, sans-serif'}),
+                        html.Div(id={'type': 'dendro-group-content', 'index': g['label']}, children=[], style={'marginTop':'6px'})
                     ], style=row_style))
 
                 if len(groups) > max_show:
-                    children.append(html.Div(f"And {len(groups)-max_show} more groups...",
-                                             style={'fontStyle': 'italic', 'color': '#6b6b6b'}))
+                    children.append(html.Div(f"And {len(groups)-max_show} more groups...", style={'fontStyle': 'italic', 'color': '#6b6b6b'}))
 
-                return fig, level_label, children, slider_max, slider_marks, breadcrumb
+                return fig, level_label, children, slider_max, slider_marks
             except Exception as e:
-                import traceback
                 print('Error building dendrogram figure:', e)
-                print(traceback.format_exc())
-                return go.Figure(), 'Error building dendrogram', html.Div('Error'), dash.no_update, dash.no_update, []
+                return go.Figure(), 'Error building dendrogram', html.Div('Error'), dash.no_update, dash.no_update
 
         # When a dendrogram leaf is clicked, add that book to the global selected books store
-        # (or drill down if it's a cluster node)
         @self.app.callback(
-            [Output('additional-books-dropdown', 'value', allow_duplicate=True),
-             Output('network-selected-books-visibility-store', 'data', allow_duplicate=True),
-             Output('dendro-drilldown-store', 'data', allow_duplicate=True)],
+            [Output('additional-books-dropdown', 'value', allow_duplicate=True), Output('network-selected-books-visibility-store', 'data', allow_duplicate=True)],
             Input('dendrogram-graph', 'clickData'),
             [State('additional-books-dropdown', 'value'), State('network-selected-books-visibility-store', 'data')],
             prevent_initial_call=True
         )
         def select_book_from_dendro(clickData, dropdown_val, current_vis):
             if not clickData:
-                return dash.no_update, dash.no_update, dash.no_update
+                return dash.no_update, dash.no_update
             try:
-                pt = clickData['points'][0]
-                custom = pt.get('customdata', '')
-                if isinstance(custom, list):
-                    custom = custom[0] if custom else ''
-                custom = str(custom)
-                if custom.startswith('cluster_'):
-                    # Drill-down into this cluster — customdata contains original book indices
-                    indices_str = custom.replace('cluster_', '')
-                    book_indices = [int(x) for x in indices_str.split(',') if x]
-                    if len(book_indices) > 2:
-                        return dash.no_update, dash.no_update, book_indices
-                    return dash.no_update, dash.no_update, dash.no_update
-                # Single book — add to dropdown
-                book_name = custom
-                if not book_name:
-                    return dash.no_update, dash.no_update, dash.no_update
+                text = clickData['points'][0].get('text', '')
+                # text format: "<book> — group <g>"
+                book_name = text.split(' — ')[0]
                 dropdown_val = dropdown_val or []
                 if book_name in dropdown_val:
-                    return dropdown_val, True, dash.no_update
-                return dropdown_val + [book_name], True, dash.no_update
+                    return dropdown_val, True
+                return dropdown_val + [book_name], True
             except Exception as e:
                 print('Error selecting book from dendrogram:', e)
-                return dash.no_update, dash.no_update, dash.no_update
-
-        # Back button resets drill-down, clears search, and clears highlight
-        @self.app.callback(
-            [Output('dendro-drilldown-store', 'data', allow_duplicate=True),
-             Output('dendro-search-book-dropdown', 'value', allow_duplicate=True),
-             Output('dendro-highlight-store', 'data', allow_duplicate=True)],
-            Input('dendro-back-btn', 'n_clicks'),
-            prevent_initial_call=True
-        )
-        def reset_dendro_drilldown(n_clicks):
-            if n_clicks:
-                return None, None, None
-            return dash.no_update, dash.no_update, dash.no_update
+                return dash.no_update, dash.no_update
 
         # When a group 'Select' button clicked, add group's books to the global selected store
         @self.app.callback(
@@ -2280,90 +2051,16 @@ class BookSimilarityDashboard:
                 return None
             return label
 
-        # Drill down into a specific group from its card button
+        # Show/Hide selected books callbacks: update a local store + swap button styles
         @self.app.callback(
-            Output('dendro-drilldown-store', 'data', allow_duplicate=True),
-            [Input({'type': 'dendro-drilldown-group-btn', 'index': ALL}, 'n_clicks')],
-            [State('dendro-level-slider', 'value'), State('dendro-font-store', 'data')],
+            [Output('dendro-show-selected', 'data'),
+             Output('dendro-hide-selected-btn', 'style'),
+             Output('dendro-show-selected-btn', 'style')],
+            [Input('dendro-show-selected-btn', 'n_clicks'), Input('dendro-hide-selected-btn', 'n_clicks')],
+            [State('dendro-show-selected', 'data')],
             prevent_initial_call=True
         )
-        def drilldown_into_group(n_clicks_list, level, font):
-            ctx = dash.callback_context
-            if not ctx.triggered:
-                return dash.no_update
-            if not any(n_clicks_list):
-                return dash.no_update
-            trig = ctx.triggered[0]['prop_id'].split('.')[0]
-            try:
-                import json
-                idd = json.loads(trig)
-                label = int(idd['index'])
-            except Exception as e:
-                print('Error parsing drill-down trigger:', e)
-                return dash.no_update
-            try:
-                if font == 'italic':
-                    n1hat = self.n1hat_it
-                elif font == 'roman':
-                    n1hat = self.n1hat_rm
-                else:
-                    n1hat = self.n1hat_rm + self.n1hat_it
-                adj = (n1hat >= level).astype(int)
-                np.fill_diagonal(adj, 0)
-                _, labels = connected_components(csr_matrix(adj), directed=False)
-                nodes = sorted(int(x) for x in np.where(labels == label)[0])
-                if len(nodes) > 2:
-                    return nodes
-            except Exception as e:
-                print('Error computing group nodes for drill-down:', e)
-            return dash.no_update
-
-        # Search book → drill down into its group (or highlight if singleton)
-        @self.app.callback(
-            [Output('dendro-drilldown-store', 'data', allow_duplicate=True),
-             Output('dendro-highlight-store', 'data', allow_duplicate=True)],
-            Input('dendro-search-book-dropdown', 'value'),
-            [State('dendro-level-slider', 'value'),
-             State('dendro-font-store', 'data')],
-            prevent_initial_call=True
-        )
-        def search_book_drilldown(book_name, level, font):
-            """When user selects a book from the search dropdown, drill down into
-            the group that contains it at the current cut level.
-            For small groups (≤2 books), highlight the group in the full tree instead."""
-            if not book_name:
-                # Cleared → back to full tree, clear highlight
-                return None, None
-            book_list = list(self.books)
-            if book_name not in book_list:
-                return dash.no_update, dash.no_update
-            if font == 'italic':
-                n1hat = self.n1hat_it
-            elif font == 'roman':
-                n1hat = self.n1hat_rm
-            else:
-                n1hat = self.n1hat_rm + self.n1hat_it
-            adj = (n1hat >= level).astype(int)
-            np.fill_diagonal(adj, 0)
-            _, comp_labels = connected_components(csr_matrix(adj), directed=False)
-            book_idx = book_list.index(book_name)
-            group_label = int(comp_labels[book_idx])
-            group_nodes = sorted(int(x) for x in np.where(comp_labels == group_label)[0])
-            if len(group_nodes) <= 2:
-                # Group too small for a subtree → highlight it in the full tree
-                return None, group_label
-            # Large enough → drill down, clear any previous highlight
-            return group_nodes, None
-
-        # Hide singletons toggle
-        @self.app.callback(
-            [Output('dendro-hide-singletons', 'data'),
-             Output('dendro-hide-singletons-btn', 'style')],
-            Input('dendro-hide-singletons-btn', 'n_clicks'),
-            State('dendro-hide-singletons', 'data'),
-            prevent_initial_call=True
-        )
-        def toggle_hide_singletons(n_clicks, current_val):
+        def set_dendro_show_selected(show_clicks, hide_clicks, current_val):
             _base = {'marginRight': '5px', 'marginBottom': '8px', 'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
                      'fontFamily': 'Inter, Arial, sans-serif', 'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
                      'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
@@ -2371,11 +2068,17 @@ class BookSimilarityDashboard:
                      'lineHeight': '1', 'width': '120px', 'minWidth': '120px'}
             _active = {**_base, 'backgroundColor': '#2f4a84', 'color': 'white'}
             _inactive = {**_base, 'backgroundColor': '#DBD1B5', 'color': '#5a5040'}
-            new_val = not current_val
-            return new_val, _active if new_val else _inactive
-
-    def _register_core_visualization_callbacks(self):
-        """Central visualization update + UMAP position source."""
+            ctx = dash.callback_context
+            if not ctx.triggered:
+                return dash.no_update, dash.no_update, dash.no_update
+            trigger = ctx.triggered[0]['prop_id'].split('.')[0]
+            if trigger == 'dendro-show-selected-btn':
+                # show is now active → Hide becomes secondary, Show becomes primary
+                return True, _inactive, _active
+            if trigger == 'dendro-hide-selected-btn':
+                # hide is active → Hide becomes primary, Show becomes secondary
+                return False, _active, _inactive
+            return dash.no_update, dash.no_update, dash.no_update
 
         # Font type update callback - updates network graph and heatmap
         @self.app.callback(
@@ -2593,6 +2296,33 @@ class BookSimilarityDashboard:
                 print("ERROR in update_visualizations:", e)
                 print(traceback.format_exc())
                 return dash.no_update, dash.no_update, dash.no_update
+        # # Recalculate UMAP positions for selected font (computes and caches per-font UMAP)
+        # @self.app.callback(
+        #     [Output('umap-positions-store', 'data'), Output('network-graph', 'figure')],
+        #     [Input('recalculate-umap-btn', 'n_clicks')],
+        #     [State('umap-n-neighbors', 'value'), State('umap-min-dist', 'value'), State('umap-pos-source-store', 'data'),
+        #      State('edge-opacity-slider', 'value'), State('network-graph', 'figure'), State('node-size-slider', 'value'), State('label-size-slider', 'value'), State('font-type-store', 'data')],
+        #     prevent_initial_call=True
+        # )
+        # def recalc_umap(n_clicks, n_neighbors, min_dist, umap_pos_source, edge_opacity, current_network_fig, node_size, label_size, current_edge_font):
+        #     if not n_clicks:
+        #         return dash.no_update, dash.no_update
+        #     print(f"Recalculating UMAP for positions source '{umap_pos_source}' (n_neighbors={n_neighbors}, min_dist={min_dist})")
+        #     # Compute and cache UMAP positions for this positions source (may take time)
+        #     umap_positions = self._load_umap_positions(font_type=umap_pos_source, n_neighbors=n_neighbors, min_dist=min_dist, compute_if_missing=True)
+        #     if umap_positions is None:
+        #         print("UMAP recomputation failed or was aborted.")
+        #         return dash.no_update, dash.no_update
+        #     umap_array = np.asarray(umap_positions, dtype=np.float32)
+        #     # Ensure edges for current selected edge font exist so graph can be built
+        #     try:
+        #         self._ensure_precomputed_edges(current_edge_font, top_k=self.top_k, n_bins=self.n_bins)
+        #     except Exception as e:
+        #         print(f"Warning: Edge ensure failed during UMAP recalc: {e}")
+        #     # Recreate network graph using the *selected edge font* (edges unaffected by position source)
+        #     network_fig = self._create_network_graph(umap_array, edge_opacity or 1.0, marker_size=node_size, label_size=label_size, font_type=current_edge_font)
+        #     return umap_array.tolist(), network_fig
+
         @self.app.callback(
             [Output('umap-pos-source-store', 'data'), Output('umap-pos-combined-btn', 'style'), Output('umap-pos-roman-btn', 'style'), Output('umap-pos-italic-btn', 'style')],
             [Input('umap-pos-combined-btn', 'n_clicks'), Input('umap-pos-roman-btn', 'n_clicks'), Input('umap-pos-italic-btn', 'n_clicks')],
@@ -2650,9 +2380,6 @@ class BookSimilarityDashboard:
                 network_fig = nf
             print(f"DEBUG: handle_umap_pos_source_change returning network_fig type={type(network_fig)}")
             return umap_array.tolist(), network_fig     
-
-    def _register_filter_callbacks(self):
-        """Filter setup, printer/book selectors, matrix click, overlays, letter quick-select."""
            
         # Initialize letter filter and printer dropdown on load
         @self.app.callback(
@@ -2876,9 +2603,6 @@ class BookSimilarityDashboard:
             'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
             'width': '120px', 'minWidth': '120px', 'maxWidth': '120px'
         }
-
-    def _register_network_callbacks(self):
-        """Network graph controls: labels, markers, printers, node click, sliders, selected books, legend sync."""
         
         # Show/Hide all labels on network graph
         @self.app.callback(
@@ -3434,9 +3158,6 @@ class BookSimilarityDashboard:
                 store_update = False
             
             return patched_fig, selected_books, show_sel_style, hide_sel_style, store_update
-
-    def _register_heatmap_callbacks(self):
-        """Heatmap printer toggle and dynamic tick font on zoom."""
         
         # Toggle heatmap printer visibility
         @self.app.callback(
@@ -3589,9 +3310,6 @@ class BookSimilarityDashboard:
             except Exception as e:
                 print(f"Error adjusting font size: {e}")
                 return dash.no_update
-
-    def _register_export_and_comparison_callbacks(self):
-        """HTML export and letter comparison panel."""
         
         @self.app.callback(
             [Output('export-status', 'children'),
@@ -3833,24 +3551,12 @@ class BookSimilarityDashboard:
                            style={'textAlign': 'center', 'color': 'gray', 'fontSize': '10px'})
                 ])
         
-
-    def _setup_callbacks(self):
-        """Setup dashboard callbacks — delegates to sub-methods."""
-        self._register_font_callbacks()
-        self._register_dendrogram_callbacks()
-        self._register_core_visualization_callbacks()
-        self._register_filter_callbacks()
-        self._register_network_callbacks()
-        self._register_heatmap_callbacks()
-        self._register_export_and_comparison_callbacks()
-
         # Debug: confirm callback setup finished
         try:
             print(f"DEBUG: _setup_callbacks completed - {len(self.app.callback_map)} callbacks registered; keys sample: {list(self.app.callback_map.keys())[:8]}")
         except Exception as e:
             print("DEBUG: _setup_callbacks completed - callback_map inspect failed:", e)
     
-
     def _encode_image(self, image_path):
         """Load image directly from disk without caching"""
         try:

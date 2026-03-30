@@ -1,0 +1,80 @@
+# ==============================================================================
+# sueltas-app configuration
+# ==============================================================================
+# Copy this file or edit it directly. All values shown are the defaults.
+# To override, change the value and restart the dashboard.
+
+# --- Server -------------------------------------------------------------------
+server:
+  port: 8050
+  host: "0.0.0.0"
+  debug: false
+  # URL prefix for reverse-proxy deployments (e.g. "/sueltas/").
+  # Can also be set via the REQUESTS_PATHNAME_PREFIX env var.
+  requests_pathname_prefix: "/sueltas/"
+
+# --- Data files ---------------------------------------------------------------
+# Paths are relative to the working directory where launch_dashboard.py is run.
+data:
+  n1hat_it_matrix: "./n1hat_it_matrix_ordered.npy"
+  n1hat_rm_matrix: "./n1hat_rm_matrix_ordered.npy"
+  books: "./books_dashboard_ordered.npy"
+  impr_names: "./impr_names_dashboard_ordered.npy"
+  symbs: "./symbs_dashboard.npy"
+  w_rm_matrix: "./w_rm_matrix_ordered.npy"
+  w_it_matrix: "./w_it_matrix_ordered.npy"
+
+# --- Images -------------------------------------------------------------------
+# The images_cache/ directory must contain one sub-folder per book, named
+# exactly as the book identifier in books_dashboard_ordered.npy (e.g.
+# "BNE_1000_891_T-55340-18").  Inside each sub-folder, place WebP images
+# of extracted letter glyphs.  File names should follow the pattern:
+#
+#     <letter>_<index>.webp        e.g.  a_001.webp, B_002.webp
+#
+# The metadata file images_cache/images_cache_meta.pkl is a pickled dict
+# with at least {"all_letters": ["a", "b", ...]} listing the available
+# letter labels.
+#
+# Example tree:
+#   images_cache/
+#   ├── images_cache_meta.pkl
+#   ├── BNE_1000_891_T-55340-18/
+#   │   ├── a_001.webp
+#   │   ├── e_002.webp
+#   │   └── o_003.webp
+#   └── BNE_1001_615_T-55281-18/
+#       ├── a_001.webp
+#       └── s_002.webp
+images:
+  cache_dir: "./images_cache/"
+  # "preload" loads all images into RAM at startup (fast browsing, more memory).
+  # "lazy" only indexes directories; images are served on demand via HTTP
+  #         (slower first view per book, but much faster startup & less memory).
+  loading_strategy: "lazy"
+
+# --- UMAP ---------------------------------------------------------------------
+umap:
+  n_neighbors: 50
+  min_dist: 0.5
+
+# --- Network graph ------------------------------------------------------------
+network:
+  top_k: 5000          # Maximum number of edges to display
+  n_bins: 10           # Number of opacity bins for edge weights
+
+  # Default slider values
+  edge_opacity: 1.0
+  node_size: 12
+  label_size: 8
+
+# --- Dendrogram ---------------------------------------------------------------
+dendrogram:
+  default_cut_level: 6
+  default_truncation: 30     # show this many leaf clusters (lastp mode); set to 0 or n_books to disable
+
+# --- Caching ------------------------------------------------------------------
+cache:
+  max_figure_entries: 10
+  max_umap_entries: 5
+  edge_cache_max_files: 3    # LRU limit for on-disk edge cache files

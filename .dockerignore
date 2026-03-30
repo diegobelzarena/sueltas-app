@@ -1,0 +1,57 @@
+# =============================================================================
+# .dockerignore — keep the Docker build context small and secure
+# =============================================================================
+
+# --- Version control & IDE ---
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# --- Python bytecode & caches ---
+__pycache__/
+*.pyc
+*.pyo
+dashboard_data_cache.pkl
+dashboard_figures_cache.pkl
+
+# --- Virtual environments ---
+venv/
+env/
+.build/
+
+# --- Development / profiling / scripts ---
+scripts/
+profiles/
+*.ipynb
+.ipynb_checkpoints/
+.notebooks/
+something.ipynb
+
+# --- Build artifacts & archives ---
+*.tar
+*.zip
+*.tar.gz
+!images_cache.tar.gz
+*.log
+*.cache
+suelta-app_latest.tar
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- Environment / secrets ---
+.env
+.env.*
+
+# --- Images: raw folder excluded; the .tar.gz archive is used instead ---
+images_cache/
+
+# --- Data files only needed for initial computation (not at runtime) ---
+# Uncomment these if you pre-compute edge caches and no longer need weight matrices:
+# w_rm_matrix_ordered.npy
+# w_it_matrix_ordered.npy
+# components_lineage.npy
+# components_nodes_gte.npy
+# idxs_order.npy

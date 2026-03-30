@@ -1,13 +1,34 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+
+# Environment
 .env
+
+# IDE
 .vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated / runtime artifacts
 static_site/
 *.log
 *.cache
-.DS_Store
-scripts/
 profiles/
-.dockerignore
-Dockerfile
-*.webp
+dashboard_figures_cache.pkl
+
+# Jupyter
+.ipynb_checkpoints/
+something.ipynb
+
+# Images
+images_cache/
+*.tar
+*.tar.gz
+_image_extract/
