@@ -12,7 +12,10 @@ conda activate dash
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Launch
+# 3. Run the preflight check (verifies data files & builds caches)
+python scripts/preflight.py
+
+# 4. Launch
 python launch_dashboard.py
 # → open http://localhost:8050
 ```
@@ -29,6 +32,55 @@ To serve under a URL prefix (reverse proxy):
 ```bash
 docker run -e REQUESTS_PATHNAME_PREFIX=/sueltas/ -p 8050:8050 sueltas-app python launch_dashboard.py
 ```
+
+## Preflight check
+
+Before launching the dashboard for the first time, run the **preflight script** to verify that all required data files are present and to pre-generate any missing caches:
+
+```bash
+python scripts/preflight.py
+```
+
+The script will:
+
+1. **Check required files** — the 5 core `.npy` matrices and `images_cache/images_cache_meta.pkl`. If any are missing the script stops with a clear error message.
+2. **Check optional files** — weight matrices (`w_*.npy`) and UMAP caches.
+3. **Verify image directories** — confirms each book listed in `books_dashboard_ordered.npy` has a matching subdirectory under `images_cache/`.
+4. **Generate edge caches** — computes `edges_cache_*.pkl` from the weight matrices if they don't already exist. Requires `w_rm_matrix_ordered.npy` and `w_it_matrix_ordered.npy`.
+5. **Generate UMAP caches** — computes `umap_*.npy` position files from the similarity matrices if missing (requires `umap-learn`). Use `--skip-umap` to skip this step if `umap-learn` is not installed or the dataset is very large.
+
+### Minimum files needed
+
+To run the preflight (and the app) you **must** provide at least these files:
+
+| File | What it is |
+|------|------------|
+| `n1hat_it_matrix_ordered.npy` | Italic similarity matrix (books × books) |
+| `n1hat_rm_matrix_ordered.npy` | Roman similarity matrix (books × books) |
+| `books_dashboard_ordered.npy` | Array of book identifiers |
+| `impr_names_dashboard_ordered.npy` | Array of printer names per book |
+| `symbs_dashboard.npy` | Symbol / character labels |
+| `images_cache/images_cache_meta.pkl` | Image metadata (pickled dict) |
+
+Everything else (edge caches, UMAP positions) is generated automatically by the preflight script, provided you also supply the weight matrices (`w_rm_matrix_ordered.npy`, `w_it_matrix_ordered.npy`) for edge caches and have `umap-learn` installed for UMAP positions.
+
+### Options
+
+```bash
+python scripts/preflight.py                 # full check + generate all caches
+python scripts/preflight.py --skip-umap      # skip UMAP computation
+python scripts/preflight.py --config other.yaml  # use a different config file
+```
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | All checks passed. |
+| `1` | Required files are missing — the app cannot start. |
+| `2` | Cache generation failed (app may still work but will be slower on first use). |
+
+> **Tip:** For a detailed breakdown of every file the app uses, see [`FILE_DEPENDENCIES.md`](FILE_DEPENDENCIES.md).
 
 ## Required data files
 
@@ -96,6 +148,7 @@ All tuneable parameters live in [`config.yaml`](config.yaml). Key sections:
 ├── images_cache/                  # Pre-extracted letter images (WebP)
 │   └── BNE_<id>/                  # One folder per book
 ├── scripts/
+│   ├── preflight.py               # Verify data files & pre-generate caches
 │   ├── export_static_site.py      # Export dashboard as static HTML
 │   ├── remove_pngs.py            # Cleanup utility (PNG → WebP migration)
 │   └── verify_figs.py            # Quick smoke test for figure generation
