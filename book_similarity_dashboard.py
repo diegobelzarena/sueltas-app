@@ -61,6 +61,24 @@ class BookSimilarityDashboard:
         self._image_loading_strategy = img_cfg.get("loading_strategy", "preload")
         os.makedirs(self._cache_dir, exist_ok=True)
 
+        # Button styles for toggle buttons (network panel)
+        self._active_btn_style = {
+            'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+            'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
+            'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+            'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+            'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+            'width': '120px', 'minWidth': '120px', 'maxWidth': '120px'
+        }
+        self._inactive_btn_style = {
+            'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
+            'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
+            'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
+            'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
+            'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
+            'width': '120px', 'minWidth': '120px', 'maxWidth': '120px'
+        }
+
         # Track last selected font to know when to reload edge caches
         self._last_font_type = None
 
@@ -2904,23 +2922,7 @@ class BookSimilarityDashboard:
                 return [l for l in self._all_letters if l.isupper()]
             return dash.no_update
         
-        # Define button styles for active/inactive states
-        active_btn_style = {
-            'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
-            'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#2f4a84', 'color': 'white',
-            'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
-            'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
-            'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
-            'width': '120px', 'minWidth': '120px', 'maxWidth': '120px'
-        }
-        inactive_btn_style = {
-            'padding': '8px 16px', 'fontSize': '12px', 'fontWeight': '500',
-            'fontFamily': 'Inter, Arial, sans-serif', 'backgroundColor': '#DBD1B5', 'color': '#5a5040',
-            'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer', 'display': 'inline-flex',
-            'alignItems': 'center', 'justifyContent': 'center', 'boxShadow': '0 1px 3px rgba(0,0,0,0.2)',
-            'transition': 'background-color 0.15s ease, transform 0.05s ease', 'lineHeight': '1',
-            'width': '120px', 'minWidth': '120px', 'maxWidth': '120px'
-        }
+        # Button styles are defined in self._active_btn_style / self._inactive_btn_style
 
     def _register_network_callbacks(self):
         """Network graph controls: labels, markers, printers, node click, sliders, selected books, legend sync."""
@@ -2946,8 +2948,8 @@ class BookSimilarityDashboard:
             show_labels = (trigger_id == 'show-all-labels-btn')
             
             # Set button styles based on which is active (consistent margins)
-            show_style = {**active_btn_style, 'marginBottom': '8px'} if show_labels else {**inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
-            hide_style = {**active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'} if not show_labels else {**inactive_btn_style, 'marginBottom': '8px'}
+            show_style = {**self._active_btn_style, 'marginBottom': '8px'} if show_labels else {**self._inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            hide_style = {**self._active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'} if not show_labels else {**self._inactive_btn_style, 'marginBottom': '8px'}
             
             if not current_fig.get('data'):
                 return dash.no_update, show_style, hide_style
@@ -2989,8 +2991,8 @@ class BookSimilarityDashboard:
             show_markers = trigger_id == 'show-all-markers-btn'
             
             # Set button styles based on which is active
-            show_style = {**active_btn_style} if show_markers else {**inactive_btn_style}
-            hide_style = {**active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'} if not show_markers else {**inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            show_style = {**self._active_btn_style} if show_markers else {**self._inactive_btn_style}
+            hide_style = {**self._active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'} if not show_markers else {**self._inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
             show_style['marginBottom'] = '8px'
             
             if not current_fig.get('data'):
@@ -3139,8 +3141,8 @@ class BookSimilarityDashboard:
             
             # Keep margins consistent with other toggle callbacks
             # Set button styles based on which is active
-            show_style = {**active_btn_style, 'marginBottom': '8px'} if show_all else {**inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
-            hide_style = {**active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'} if not show_all else {**inactive_btn_style, 'marginBottom': '8px'}
+            show_style = {**self._active_btn_style, 'marginBottom': '8px'} if show_all else {**self._inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            hide_style = {**self._active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'} if not show_all else {**self._inactive_btn_style, 'marginBottom': '8px'}
                         
             if not current_fig.get('data'):
                 return dash.no_update, show_style, hide_style, dash.no_update
@@ -3325,10 +3327,10 @@ class BookSimilarityDashboard:
             trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
             
             # Button styles
-            active_style = {**active_btn_style, 'marginBottom': '8px'}
-            inactive_style = {**inactive_btn_style, 'marginBottom': '8px'}
-            active_style_mr = {**active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
-            inactive_style_mr = {**inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            active_style = {**self._active_btn_style, 'marginBottom': '8px'}
+            inactive_style = {**self._inactive_btn_style, 'marginBottom': '8px'}
+            active_style_mr = {**self._active_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
+            inactive_style_mr = {**self._inactive_btn_style, 'marginRight': '5px', 'marginBottom': '8px'}
             
             selected_books = selected_books or []
             show_selected = trigger_id == 'show-selected-books-btn'
