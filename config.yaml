@@ -15,29 +15,30 @@ server:
 
 # --- Data files ---------------------------------------------------------------
 # Paths are relative to the working directory where launch_dashboard.py is run.
+# By default all data lives under the data/ directory.
 data:
-  n1hat_it_matrix: "./n1hat_it_matrix_ordered.npy"
-  n1hat_rm_matrix: "./n1hat_rm_matrix_ordered.npy"
-  books: "./books_dashboard_ordered.npy"
-  impr_names: "./impr_names_dashboard_ordered.npy"
-  symbs: "./symbs_dashboard.npy"
-  w_rm_matrix: "./w_rm_matrix_ordered.npy"
-  w_it_matrix: "./w_it_matrix_ordered.npy"
+  n1hat_it_matrix: "./data/n1hat_it_matrix_ordered.npy"
+  n1hat_rm_matrix: "./data/n1hat_rm_matrix_ordered.npy"
+  books: "./data/books_dashboard_ordered.npy"
+  impr_names: "./data/impr_names_dashboard_ordered.npy"
+  symbs: "./data/symbs_dashboard.npy"
+  w_rm_matrix: "./data/w_rm_matrix_ordered.npy"
+  w_it_matrix: "./data/w_it_matrix_ordered.npy"
 
 # --- Images -------------------------------------------------------------------
-# The images_cache/ directory must contain one sub-folder per book, named
+# The data/images/ directory must contain one sub-folder per book, named
 # exactly as the book identifier in books_dashboard_ordered.npy (e.g.
 # "BNE_1000_891_T-55340-18").  Inside each sub-folder, place WebP images
 # of extracted letter glyphs.  File names should follow the pattern:
 #
 #     <letter>_<index>.webp        e.g.  a_001.webp, B_002.webp
 #
-# The metadata file images_cache/images_cache_meta.pkl is a pickled dict
+# The metadata file data/images/images_cache_meta.pkl is a pickled dict
 # with at least {"all_letters": ["a", "b", ...]} listing the available
 # letter labels.
 #
 # Example tree:
-#   images_cache/
+#   data/images/
 #   ├── images_cache_meta.pkl
 #   ├── BNE_1000_891_T-55340-18/
 #   │   ├── a_001.webp
@@ -47,7 +48,7 @@ data:
 #       ├── a_001.webp
 #       └── s_002.webp
 images:
-  cache_dir: "./images_cache/"
+  cache_dir: "./data/images/"
   # "preload" loads all images into RAM at startup (fast browsing, more memory).
   # "lazy" only indexes directories; images are served on demand via HTTP
   #         (slower first view per book, but much faster startup & less memory).
