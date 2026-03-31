@@ -5,42 +5,60 @@ Interactive dashboard for exploring typographic similarity across a corpus of hi
 ## Quick start
 
 ```bash
-# 1. Create / activate a Python 3.11 environment
+# 1. Clone the repository (matrices & CSV are included)
+git clone https://github.com/<owner>/sueltas-app.git
+cd sueltas-app
+
+# 2. Download the image archive and extract it
+#    → see "Image data" below for the download link
+tar xzf images_cache.tar.gz -C data/images
+
+# 3. Create / activate a Python 3.11 environment
 conda create -n dash python=3.11 -y
 conda activate dash
 
-# 2. Install dependencies
+# 4. Install dependencies
 pip install -r requirements.txt
 
-# 3. Place your data files in the data/ directory (see "Data files" below)
-
-# 4. Run the preflight check (verifies files & builds caches)
+# 5. Run the preflight check (verifies files & builds caches)
 python scripts/preflight.py
 
-# 5. Launch
+# 6. Launch
 python launch_dashboard.py
+# → open http://localhost:8050
+```
+
+### Quick start with Docker
+
+```bash
+git clone https://github.com/<owner>/sueltas-app.git
+cd sueltas-app
+# download images_cache.tar.gz into the repo root (see below)
+docker build -t sueltas-app .
+docker run -d -p 8050:8050 sueltas-app
 # → open http://localhost:8050
 ```
 
 ## Data files
 
-All data lives under the `data/` directory (git-ignored). Place your files there before running the app:
+The repository ships with all numerical data needed to run the dashboard:
 
 ```
-data/
-├── n1hat_it_matrix_ordered.npy     # Italic similarity matrix (books × books)    [required]
-├── n1hat_rm_matrix_ordered.npy     # Roman similarity matrix (books × books)     [required]
-├── books_dashboard_ordered.npy     # Array of book identifiers                   [required]
-├── impr_names_dashboard_ordered.npy# Printer names per book                      [required]
-├── symbs_dashboard.npy             # Symbol / character labels                   [required]
-├── w_rm_matrix_ordered.npy         # Weight matrix — roman                       [optional*]
-├── w_it_matrix_ordered.npy         # Weight matrix — italic                      [optional*]
-├── umap_combined_50_0.5.npy        # UMAP positions — combined                   [auto-generated]
-├── umap_roman_50_0.5.npy           # UMAP positions — roman                      [auto-generated]
-├── umap_italic_50_0.5.npy          # UMAP positions — italic                     [auto-generated]
-└── images/                         # Per-book WebP letter images
-    ├── images_cache_meta.pkl       # Image metadata (pickled dict)               [required]
-    ├── edges_cache_*.pkl           #                                             [auto-generated]
+data/                                  ← checked into git
+├── n1hat_it_matrix_ordered.npy        # Italic similarity matrix (books × books)
+├── n1hat_rm_matrix_ordered.npy        # Roman similarity matrix (books × books)
+├── books_dashboard_ordered.npy        # Array of book identifiers
+├── impr_names_dashboard_ordered.npy   # Printer names per book
+├── symbs_dashboard.npy                # Symbol / character labels
+├── w_rm_matrix_ordered.npy            # Weight matrix — roman
+├── w_it_matrix_ordered.npy            # Weight matrix — italic
+├── Corpus_600.csv                     # Corpus metadata
+├── umap_combined_50_0.5.npy           # UMAP positions — combined      [auto-generated]
+├── umap_roman_50_0.5.npy              # UMAP positions — roman          [auto-generated]
+├── umap_italic_50_0.5.npy             # UMAP positions — italic         [auto-generated]
+└── images/                            ← NOT in git — see below
+    ├── images_cache_meta.pkl          # Image metadata (pickled dict)
+    ├── edges_cache_*.pkl              #                                 [auto-generated]
     ├── BNE_1000_891_T-55340-18/
     │   ├── roman_lower-a_001.webp
     │   └── ...
@@ -48,7 +66,21 @@ data/
         └── ...
 ```
 
-\* Weight matrices are only needed if edge caches haven't been generated yet. After the first `preflight.py` run they can be removed to save space.
+### Image data
+
+The `data/images/` directory (~610 book folders, 69 000 WebP images, ~10 MB compressed) is **not** tracked in git. Download the archive and extract it:
+
+| Download | Link |
+|----------|------|
+| `images_cache.tar.gz` | **[TODO: add Zenodo / Google Drive link]** |
+
+```bash
+# Create the directory and extract
+mkdir -p data/images          # (PowerShell: New-Item -ItemType Directory -Force data/images)
+tar xzf images_cache.tar.gz -C data/images
+```
+
+The archive already includes pre-computed edge caches (`edges_cache_*.pkl`) and image metadata (`images_cache_meta.pkl`), so `preflight.py` will not need to regenerate them.
 
 ### Image conventions
 
@@ -85,20 +117,61 @@ The script will:
 
 ## Docker
 
-```bash
-# Prep: compress images for baking into the container
-tar czf images_cache.tar.gz -C data/images .
+The Docker image bundles everything into a single portable container. Since the `.npy` matrices and CSV are already in the repo, you only need the `images_cache.tar.gz` archive in the repo root before building.
 
-# Build & run
+### Clone → Build → Run
+
+```bash
+git clone https://github.com/<owner>/sueltas-app.git
+cd sueltas-app
+
+# Download images_cache.tar.gz into the repo root
+# (see "Image data" above for the download link)
+
 docker build -t sueltas-app .
-docker run -p 8050:8050 sueltas-app
+docker run -d -p 8050:8050 sueltas-app
+# → open http://localhost:8050
 ```
 
-To serve under a URL prefix (reverse proxy):
+Or with Docker Compose:
 
 ```bash
-docker run -e REQUESTS_PATHNAME_PREFIX=/sueltas/ -p 8050:8050 sueltas-app
+docker compose up -d
 ```
+
+### What goes into the image
+
+| Layer | Source | How |
+|-------|--------|-----|
+| Python code, `config.yaml`, `assets/` | repo | `COPY . ./` |
+| `.npy` matrices & CSV (`data/`) | repo | `COPY . ./` |
+| Letter images + caches (`data/images/`) | `images_cache.tar.gz` | `ADD` (auto-extracts) |
+
+The `.dockerignore` excludes `data/images/` (raw folder), `scripts/`, `docs/`, `.git/`, and other dev files — only the archive is used for images.
+
+### Serving behind a reverse proxy
+
+```bash
+docker run -d -p 8050:8050 -e REQUESTS_PATHNAME_PREFIX=/sueltas/ sueltas-app
+```
+
+### Rebuilding the image archive
+
+If you modify images locally, recreate the archive before rebuilding:
+
+```bash
+# (optional) regenerate edge caches first so they're baked in
+python scripts/preflight.py
+
+tar czf images_cache.tar.gz -C data/images .
+docker build -t sueltas-app .
+```
+
+| What changed | What to do |
+|--------------|------------|
+| Images in `data/images/` | Re-create `images_cache.tar.gz`, then `docker build` |
+| `.npy` matrices in `data/` | Just `docker build` |
+| Python code or config | Just `docker build` |
 
 ## Configuration
 
@@ -129,9 +202,10 @@ sueltas-app/
 ├── assets/
 │   ├── style.css                  # Dashboard styling
 │   └── legend-click-helpers.js    # Legend interaction helpers
-├── data/                          # Data files (git-ignored, user-provided)
+├── data/                          # Matrices & CSV (tracked); images (git-ignored)
 │   ├── *.npy                      # Similarity / weight / UMAP matrices
-│   └── images/                    # Per-book WebP letter images + metadata
+│   ├── Corpus_600.csv             # Corpus metadata
+│   └── images/                    # Per-book WebP letter images + caches (download separately)
 ├── scripts/
 │   ├── preflight.py               # Verify data & pre-generate caches
 │   ├── export_static_site.py      # Export as static HTML site

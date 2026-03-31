@@ -26,9 +26,9 @@ profiles/
 .ipynb_checkpoints/
 *.ipynb
 
-# Data files (large, user-provided — not tracked in git)
-data/
-!data/.gitkeep
+# Data files — matrices & CSV are tracked; images are not
+data/images/
+data/images_cache_meta.pkl
 
 # Archives
 *.tar
