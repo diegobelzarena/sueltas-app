@@ -21,16 +21,19 @@ static_site/
 *.log
 *.cache
 profiles/
-dashboard_figures_cache.pkl
 
 # Jupyter
 .ipynb_checkpoints/
-something.ipynb
+*.ipynb
 
-# Images
-images_cache/
+# Data files (large, user-provided — not tracked in git)
+data/
+!data/.gitkeep
+
+# Archives
 *.tar
 *.tar.gz
+
+# Legacy / extracted layers
 _image_extract/
 _image_app/
-__pycache__/

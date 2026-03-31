@@ -27,7 +27,7 @@ def orient_positions(umap_positions):
 
 def umap_filename(font_type, n_neighbors, min_dist):
     """Return the expected .npy filename for a UMAP cache."""
-    return f"./umap_{font_type}_{n_neighbors}_{min_dist}.npy"
+    return f"./data/umap_{font_type}_{n_neighbors}_{min_dist}.npy"
 
 
 def load_positions(font_type="combined", n_neighbors=50, min_dist=0.5,

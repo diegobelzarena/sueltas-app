@@ -2,7 +2,7 @@
 # Images are baked in via a compressed archive for a single portable image.
 #
 # PREP (once, or whenever images change):
-#   tar czf images_cache.tar.gz -C images_cache .
+#   tar czf images_cache.tar.gz -C data/images .
 #
 # BUILD:
 #   docker build -t sueltas-app .
@@ -33,7 +33,7 @@ RUN useradd -m appuser
 COPY --chown=appuser:appuser . ./
 
 # Extract images from compressed archive (ADD auto-extracts .tar.gz)
-ADD --chown=appuser:appuser images_cache.tar.gz ./images_cache/
+ADD --chown=appuser:appuser images_cache.tar.gz ./data/images/
 
 USER appuser
 

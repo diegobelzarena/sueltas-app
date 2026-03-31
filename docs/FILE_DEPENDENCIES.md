@@ -2,6 +2,8 @@
 
 This document lists every data file the application reads or generates, its format, purpose, and whether it's required.
 
+All data files live under the `data/` directory by default. Paths are configurable in `config.yaml`.
+
 ---
 
 ## Configuration
@@ -47,7 +49,7 @@ Default params from config: `n_neighbors=50`, `min_dist=0.5`.
 ## Edge Caches (Pickle `.pkl`)
 
 Generated automatically on first use by `_ensure_precomputed_edges()` and cached to disk.  
-Location: `images_cache/` (configurable via `images.cache_dir`).  
+Location: `data/images/` (configurable via `images.cache_dir`).  
 Old cache files are LRU-pruned (default max 3 files).
 
 Filename pattern: `edges_cache_{font_type}_top{top_k}_bins{n_bins}.pkl`  
@@ -71,12 +73,12 @@ Default params: `top_k=5000`, `n_bins=10`.
 
 ## Glyph Images (WebP `.webp`)
 
-Individual letter/glyph images stored per book in subdirectories of `images_cache/`.
+Individual letter/glyph images stored per book in subdirectories of `data/images/`.
 
 ### Directory structure
 
 ```
-images_cache/
+data/images/
 ├── images_cache_meta.pkl
 ├── BNE_1000_891_T-55340-18/
 │   ├── roman_lower-a_001.webp
@@ -144,7 +146,7 @@ These files exist in the workspace but are **not loaded by any current applicati
 | 3 | `symbs_dashboard.npy` | `.npy` |
 | 4 | `n1hat_it_matrix_ordered.npy` | `.npy` |
 | 5 | `n1hat_rm_matrix_ordered.npy` | `.npy` |
-| 6 | `images_cache/images_cache_meta.pkl` | `.pkl` |
+| 6 | `data/images/images_cache_meta.pkl` | `.pkl` |
 
 ### Loaded on demand / auto-generated
 
@@ -154,7 +156,7 @@ These files exist in the workspace but are **not loaded by any current applicati
 | 8 | `w_it_matrix_ordered.npy` | `.npy` |
 | 9 | `umap_{font}_{n}_{d}.npy` | `.npy` |
 | 10 | `edges_cache_{font}_top{k}_bins{b}.pkl` | `.pkl` |
-| 11 | `images_cache/{book}/*.webp` | `.webp` |
+| 11 | `data/images/{book}/*.webp` | `.webp` |
 
 ### Optional
 

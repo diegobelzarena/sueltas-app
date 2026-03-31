@@ -28,7 +28,7 @@ from PIL import Image
 import io
 
 ROOT = Path(__file__).resolve().parents[1]
-IMAGES_CACHE_DIR = ROOT / 'images_cache'
+IMAGES_CACHE_DIR = ROOT / 'data' / 'images'
 OUT_DEFAULT = ROOT / 'static_site'
 
 FONTS = ['combined', 'roman', 'italic']

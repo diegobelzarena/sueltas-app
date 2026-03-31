@@ -56,8 +56,8 @@ class BookSimilarityDashboard:
         self.EDGE_CACHE_MAX_FILES = cache_cfg.get("edge_cache_max_files", 3)
 
         # Serve images from static folder
-        self.letter_images_path = './letter_images/'
-        self._cache_dir = img_cfg.get("cache_dir", './images_cache/')
+        self.letter_images_path = './data/images/'
+        self._cache_dir = img_cfg.get("cache_dir", './data/images/')
         self._image_loading_strategy = img_cfg.get("loading_strategy", "preload")
         os.makedirs(self._cache_dir, exist_ok=True)
 
@@ -89,18 +89,18 @@ class BookSimilarityDashboard:
         self._umap_n_neighbors = umap_cfg.get("n_neighbors", 50)
         self._umap_min_dist = umap_cfg.get("min_dist", 0.5)
 
-        self.n1hat_it = np.load(data_cfg.get("n1hat_it_matrix", './n1hat_it_matrix_ordered.npy'), mmap_mode='r')
-        self.n1hat_rm = np.load(data_cfg.get("n1hat_rm_matrix", './n1hat_rm_matrix_ordered.npy'), mmap_mode='r')
-        self.books = np.load(data_cfg.get("books", './books_dashboard_ordered.npy'), mmap_mode='r')
-        self.impr_names = np.load(data_cfg.get("impr_names", './impr_names_dashboard_ordered.npy'), mmap_mode='r')
-        self.symbs = np.load(data_cfg.get("symbs", './symbs_dashboard.npy'), mmap_mode='r')
+        self.n1hat_it = np.load(data_cfg.get("n1hat_it_matrix", './data/n1hat_it_matrix_ordered.npy'), mmap_mode='r')
+        self.n1hat_rm = np.load(data_cfg.get("n1hat_rm_matrix", './data/n1hat_rm_matrix_ordered.npy'), mmap_mode='r')
+        self.books = np.load(data_cfg.get("books", './data/books_dashboard_ordered.npy'), mmap_mode='r')
+        self.impr_names = np.load(data_cfg.get("impr_names", './data/impr_names_dashboard_ordered.npy'), mmap_mode='r')
+        self.symbs = np.load(data_cfg.get("symbs", './data/symbs_dashboard.npy'), mmap_mode='r')
         print(" Loaded ordered .npy files")
         
         # Decide whether to load weight memmaps: only if edge caches are missing
         fonts = ['roman', 'italic', 'combined']
         need_edges = any(not os.path.exists(self._edge_cache_path(font, self.top_k, self.n_bins)) for font in fonts)
         # Check for per-font combined UMAP file (we only load combined positions at startup if present)
-        combined_umap_file = f'./umap_combined_{self._umap_n_neighbors}_{self._umap_min_dist}.npy'
+        combined_umap_file = f'./data/umap_combined_{self._umap_n_neighbors}_{self._umap_min_dist}.npy'
         combined_umap_present = os.path.exists(combined_umap_file)
 
         # Check the dtype of n1hat_rm, n1hat_it
@@ -138,8 +138,8 @@ class BookSimilarityDashboard:
 
         if need_edges:
             # Only load weight memmaps when needed for missing caches
-            w_rm_mmap = np.load(data_cfg.get("w_rm_matrix", './w_rm_matrix_ordered.npy'), mmap_mode='r')
-            w_it_mmap = np.load(data_cfg.get("w_it_matrix", './w_it_matrix_ordered.npy'), mmap_mode='r')
+            w_rm_mmap = np.load(data_cfg.get("w_rm_matrix", './data/w_rm_matrix_ordered.npy'), mmap_mode='r')
+            w_it_mmap = np.load(data_cfg.get("w_it_matrix", './data/w_it_matrix_ordered.npy'), mmap_mode='r')
             self._w_rm_mmap = w_rm_mmap
             self._w_it_mmap = w_it_mmap
             print("Loaded weight matrices as memory-mapped (needed for missing caches).")
@@ -222,8 +222,8 @@ class BookSimilarityDashboard:
         # Ensure weight memmaps are loaded (lazy load on demand)
         if getattr(self, '_w_rm_mmap', None) is None or getattr(self, '_w_it_mmap', None) is None:
             try:
-                self._w_rm_mmap = np.load('./w_rm_matrix_ordered.npy', mmap_mode='r')
-                self._w_it_mmap = np.load('./w_it_matrix_ordered.npy', mmap_mode='r')
+                self._w_rm_mmap = np.load('./data/w_rm_matrix_ordered.npy', mmap_mode='r')
+                self._w_it_mmap = np.load('./data/w_it_matrix_ordered.npy', mmap_mode='r')
                 print("Loaded weight matrices as memory-mapped (needed for edge computation).")
             except Exception as e:
                 print(f"Warning: Failed to load weight memmaps for edges: {e}")
@@ -3923,53 +3923,3 @@ class BookSimilarityDashboard:
         except Exception as e:
             print("DEBUG: Starting server (callback_map inspect failed):", e)
         self.app.run_server(debug=debug, port=port, host=host)
-
-
-# Helper function to load your data and run dashboard
-def create_dashboard_from_notebook():
-    """
-    Helper function to create dashboard using your notebook data.
-    Call this after running your analysis in the notebook.
-    """
-    try:
-        # Load your data (adjust paths as needed)
-        books = np.load('./report_new/names_italics.npy')  # or however you load your books
-        
-        # You'll need to expose these variables from your notebook
-        # For now, creating dummy data - replace with your actual variables
-        n_books = len(books)
-        w_rm = np.random.rand(n_books, n_books) * 0.5  # Replace with your w_rm
-        w_it = np.random.rand(n_books, n_books) * 0.5  # Replace with your w_it
-        
-        # Make symmetric
-        w_rm = (w_rm + w_rm.T) / 2
-        w_it = (w_it + w_it.T) / 2
-        np.fill_diagonal(w_rm, 0)
-        np.fill_diagonal(w_it, 0)
-        
-        # Load imprinter names if available
-        try:
-            impr_names = np.load('./report_new/impr_names_rounds.npy')
-            impr_names = np.array([name.split()[0][:1]+ '. ' + name.split()[-1] for name in impr_names])
-        except:
-            impr_names = None
-        
-        # Create and run dashboard
-        dashboard = BookSimilarityDashboard(books, w_rm, w_it, impr_names)
-        return dashboard
-        
-    except Exception as e:
-        print(f"Error loading data: {e}")
-        print("Please make sure your data files are available and variables are defined.")
-        return None
-
-
-if __name__ == "__main__":
-    # Example usage
-    print("Creating dashboard...")
-    dashboard = create_dashboard_from_notebook()
-    if dashboard:
-        print("Starting server on http://localhost:8050")
-        dashboard.run_server(debug=True)
-    else:
-        print("Failed to create dashboard. Check your data files.")

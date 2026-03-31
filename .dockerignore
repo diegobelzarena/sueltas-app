@@ -12,8 +12,6 @@
 __pycache__/
 *.pyc
 *.pyo
-dashboard_data_cache.pkl
-dashboard_figures_cache.pkl
 
 # --- Virtual environments ---
 venv/
@@ -25,8 +23,7 @@ scripts/
 profiles/
 *.ipynb
 .ipynb_checkpoints/
-.notebooks/
-something.ipynb
+docs/
 
 # --- Build artifacts & archives ---
 *.tar
@@ -35,7 +32,6 @@ something.ipynb
 !images_cache.tar.gz
 *.log
 *.cache
-suelta-app_latest.tar
 
 # --- OS junk ---
 .DS_Store
@@ -46,12 +42,8 @@ Thumbs.db
 .env.*
 
 # --- Images: raw folder excluded; the .tar.gz archive is used instead ---
-images_cache/
+data/images/
 
-# --- Data files only needed for initial computation (not at runtime) ---
-# Uncomment these if you pre-compute edge caches and no longer need weight matrices:
-# w_rm_matrix_ordered.npy
-# w_it_matrix_ordered.npy
-# components_lineage.npy
-# components_nodes_gte.npy
-# idxs_order.npy
+# --- Legacy ---
+_image_extract/
+_image_app/
