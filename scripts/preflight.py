@@ -69,14 +69,32 @@ def _load_config(path: str) -> dict:
 # 1. File existence checks
 # ---------------------------------------------------------------------------
 
+def _data_dir_from_cfg(data_cfg: dict) -> str:
+    """Return the data directory from config (data.dir key, defaults to ./data)."""
+    return data_cfg.get("dir", "./data")
+
+
+def _resolve_data_path(data_cfg: dict, key: str, default_name: str) -> str:
+    """Resolve a data file path: explicit override or default under data.dir."""
+    data_dir = _data_dir_from_cfg(data_cfg)
+    override = data_cfg.get(key)
+    if override and os.path.isabs(override):
+        return override
+    if override:
+        if os.sep in override or '/' in override:
+            return override
+        return os.path.join(data_dir, override)
+    return os.path.join(data_dir, default_name)
+
+
 def check_required_files(data_cfg: dict, cache_dir: str) -> list[str]:
     """Return a list of *missing* required file paths."""
     required = {
-        "n1hat_it_matrix":  data_cfg.get("n1hat_it_matrix",  "./data/n1hat_it_matrix_ordered.npy"),
-        "n1hat_rm_matrix":  data_cfg.get("n1hat_rm_matrix",  "./data/n1hat_rm_matrix_ordered.npy"),
-        "books":            data_cfg.get("books",            "./data/books_dashboard_ordered.npy"),
-        "impr_names":       data_cfg.get("impr_names",       "./data/impr_names_dashboard_ordered.npy"),
-        "symbs":            data_cfg.get("symbs",            "./data/symbs_dashboard.npy"),
+        "n1hat_it_matrix":  _resolve_data_path(data_cfg, "n1hat_it_matrix",  "n1hat_it_matrix_ordered.npy"),
+        "n1hat_rm_matrix":  _resolve_data_path(data_cfg, "n1hat_rm_matrix",  "n1hat_rm_matrix_ordered.npy"),
+        "books":            _resolve_data_path(data_cfg, "books",            "books_dashboard_ordered.npy"),
+        "impr_names":       _resolve_data_path(data_cfg, "impr_names",       "impr_names_dashboard_ordered.npy"),
+        "symbs":            _resolve_data_path(data_cfg, "symbs",            "symbs_dashboard.npy"),
         "images_cache_meta": os.path.join(cache_dir, "images_cache_meta.pkl"),
     }
 
@@ -90,18 +108,24 @@ def check_required_files(data_cfg: dict, cache_dir: str) -> list[str]:
     return missing
 
 
+def _derive_data_dir(data_cfg: dict) -> str:
+    """Derive the data directory from config."""
+    return os.path.abspath(_data_dir_from_cfg(data_cfg))
+
+
 def check_optional_files(data_cfg: dict, umap_cfg: dict) -> None:
     """Report status of conditional / optional files (non-blocking)."""
     optional = {
-        "w_rm_matrix":  data_cfg.get("w_rm_matrix",  "./data/w_rm_matrix_ordered.npy"),
-        "w_it_matrix":  data_cfg.get("w_it_matrix",  "./data/w_it_matrix_ordered.npy"),
+        "w_rm_matrix":  _resolve_data_path(data_cfg, "w_rm_matrix",  "w_rm_matrix_ordered.npy"),
+        "w_it_matrix":  _resolve_data_path(data_cfg, "w_it_matrix",  "w_it_matrix_ordered.npy"),
     }
 
+    data_dir = _derive_data_dir(data_cfg)
     n_neighbors = umap_cfg.get("n_neighbors", 50)
     min_dist    = umap_cfg.get("min_dist", 0.5)
     for font in ("combined", "roman", "italic"):
         key = f"umap_{font}"
-        optional[key] = umap_utils.umap_filename(font, n_neighbors, min_dist)
+        optional[key] = umap_utils.umap_filename(font, n_neighbors, min_dist, data_dir=data_dir)
 
     for label, path in optional.items():
         if os.path.exists(path):
@@ -180,8 +204,8 @@ def generate_edge_caches(data_cfg: dict, net_cfg: dict, cache_dir: str) -> bool:
         return True
 
     # We need weight matrices to compute
-    w_rm_path = data_cfg.get("w_rm_matrix", "./data/w_rm_matrix_ordered.npy")
-    w_it_path = data_cfg.get("w_it_matrix", "./data/w_it_matrix_ordered.npy")
+    w_rm_path = _resolve_data_path(data_cfg, "w_rm_matrix", "w_rm_matrix_ordered.npy")
+    w_it_path = _resolve_data_path(data_cfg, "w_it_matrix", "w_it_matrix_ordered.npy")
 
     if not os.path.exists(w_rm_path) or not os.path.exists(w_it_path):
         _status(_FAIL, f"Cannot generate edge caches — weight matrices missing:")
@@ -226,14 +250,15 @@ def generate_umap_caches(data_cfg: dict, umap_cfg: dict, *, skip: bool = False) 
     min_dist    = umap_cfg.get("min_dist", 0.5)
 
     fonts_and_matrices = {
-        "roman":    data_cfg.get("n1hat_rm_matrix", "./data/n1hat_rm_matrix_ordered.npy"),
-        "italic":   data_cfg.get("n1hat_it_matrix", "./data/n1hat_it_matrix_ordered.npy"),
+        "roman":    _resolve_data_path(data_cfg, "n1hat_rm_matrix", "n1hat_rm_matrix_ordered.npy"),
+        "italic":   _resolve_data_path(data_cfg, "n1hat_it_matrix", "n1hat_it_matrix_ordered.npy"),
         "combined": None,  # built from rm + it
     }
 
+    data_dir = _derive_data_dir(data_cfg)
     missing = []
     for font in fonts_and_matrices:
-        path = umap_utils.umap_filename(font, n_neighbors, min_dist)
+        path = umap_utils.umap_filename(font, n_neighbors, min_dist, data_dir=data_dir)
         if not os.path.exists(path):
             missing.append(font)
 
@@ -243,13 +268,13 @@ def generate_umap_caches(data_cfg: dict, umap_cfg: dict, *, skip: bool = False) 
 
     if skip:
         for font in missing:
-            path = umap_utils.umap_filename(font, n_neighbors, min_dist)
+            path = umap_utils.umap_filename(font, n_neighbors, min_dist, data_dir=data_dir)
             _status(_SKIP, f"UMAP {font:10s} → {path}  (--skip-umap)")
         return True
 
     # We need n1hat matrices to build distance matrices
-    rm_path = data_cfg.get("n1hat_rm_matrix", "./data/n1hat_rm_matrix_ordered.npy")
-    it_path = data_cfg.get("n1hat_it_matrix", "./data/n1hat_it_matrix_ordered.npy")
+    rm_path = _resolve_data_path(data_cfg, "n1hat_rm_matrix", "n1hat_rm_matrix_ordered.npy")
+    it_path = _resolve_data_path(data_cfg, "n1hat_it_matrix", "n1hat_it_matrix_ordered.npy")
 
     if not os.path.exists(rm_path) or not os.path.exists(it_path):
         _status(_FAIL, "Cannot compute UMAP — n1hat matrices missing.")
@@ -284,6 +309,7 @@ def generate_umap_caches(data_cfg: dict, umap_cfg: dict, *, skip: bool = False) 
                 min_dist=min_dist,
                 compute_if_missing=True,
                 distance_matrix=dist,
+                data_dir=data_dir,
             )
             dt = time.perf_counter() - t0
             if positions is not None:
@@ -359,7 +385,8 @@ def main() -> int:
     umap_cfg  = cfg.get("umap", {})
     net_cfg   = cfg.get("network", {})
     img_cfg   = cfg.get("images", {})
-    cache_dir = img_cfg.get("cache_dir", "./data/images/")
+    data_dir  = _data_dir_from_cfg(data_cfg)
+    cache_dir = img_cfg.get("cache_dir", os.path.join(data_dir, "images"))
 
     # ── 1. Required files ────────────────────────────────────────────
     print()
@@ -380,7 +407,7 @@ def main() -> int:
     # ── 3. Image directories ─────────────────────────────────────────
     print()
     print("── Image directories ───────────────────────────────────────")
-    books_path = data_cfg.get("books", "./data/books_dashboard_ordered.npy")
+    books_path = _resolve_data_path(data_cfg, "books", "books_dashboard_ordered.npy")
     check_images(cache_dir, books_path)
 
     # ── 4. Edge caches ───────────────────────────────────────────────

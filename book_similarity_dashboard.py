@@ -41,6 +41,7 @@ class BookSimilarityDashboard:
         net_cfg = cfg.get("network", {})
         cache_cfg = cfg.get("cache", {})
         img_cfg = cfg.get("images", {})
+        data_cfg = cfg.get("data", {})
 
         self.config = cfg
         self.books = None
@@ -55,9 +56,12 @@ class BookSimilarityDashboard:
         self.MAX_UMAP_CACHE_SIZE = cache_cfg.get("max_umap_entries", 5)
         self.EDGE_CACHE_MAX_FILES = cache_cfg.get("edge_cache_max_files", 3)
 
+        # Resolve the data directory from config
+        self._data_dir = data_cfg.get("dir", "./data")
+
         # Serve images from static folder
-        self.letter_images_path = './data/images/'
-        self._cache_dir = img_cfg.get("cache_dir", './data/images/')
+        self.letter_images_path = os.path.join(self._data_dir, 'images')
+        self._cache_dir = img_cfg.get("cache_dir", os.path.join(self._data_dir, 'images'))
         self._image_loading_strategy = img_cfg.get("loading_strategy", "preload")
         os.makedirs(self._cache_dir, exist_ok=True)
 
@@ -98,27 +102,40 @@ class BookSimilarityDashboard:
         # Register route to serve pre-extracted images from the images_cache folder
         self._register_image_route()
         
+    def _resolve_data_path(self, key, default_name):
+        """Resolve a data file path: explicit override or default under _data_dir."""
+        data_cfg = self.config.get("data", {})
+        override = data_cfg.get(key)
+        if override and os.path.isabs(override):
+            return override
+        if override:
+            # If override looks like a full relative path (contains os.sep or /), use as-is
+            if os.sep in override or '/' in override:
+                return override
+            # Otherwise treat as filename relative to data dir
+            return os.path.join(self._data_dir, override)
+        return os.path.join(self._data_dir, default_name)
+
     def set_data(self):
         """
         Initialize the dashboard with your data.
         """
-        data_cfg = self.config.get("data", {})
         umap_cfg = self.config.get("umap", {})
         self._umap_n_neighbors = umap_cfg.get("n_neighbors", 50)
         self._umap_min_dist = umap_cfg.get("min_dist", 0.5)
 
-        self.n1hat_it = np.load(data_cfg.get("n1hat_it_matrix", './data/n1hat_it_matrix_ordered.npy'), mmap_mode='r')
-        self.n1hat_rm = np.load(data_cfg.get("n1hat_rm_matrix", './data/n1hat_rm_matrix_ordered.npy'), mmap_mode='r')
-        self.books = np.load(data_cfg.get("books", './data/books_dashboard_ordered.npy'), mmap_mode='r')
-        self.impr_names = np.load(data_cfg.get("impr_names", './data/impr_names_dashboard_ordered.npy'), mmap_mode='r')
-        self.symbs = np.load(data_cfg.get("symbs", './data/symbs_dashboard.npy'), mmap_mode='r')
+        self.n1hat_it = np.load(self._resolve_data_path("n1hat_it_matrix", "n1hat_it_matrix_ordered.npy"), mmap_mode='r')
+        self.n1hat_rm = np.load(self._resolve_data_path("n1hat_rm_matrix", "n1hat_rm_matrix_ordered.npy"), mmap_mode='r')
+        self.books = np.load(self._resolve_data_path("books", "books_dashboard_ordered.npy"), mmap_mode='r')
+        self.impr_names = np.load(self._resolve_data_path("impr_names", "impr_names_dashboard_ordered.npy"), mmap_mode='r')
+        self.symbs = np.load(self._resolve_data_path("symbs", "symbs_dashboard.npy"), mmap_mode='r')
         print(" Loaded ordered .npy files")
-        
+
         # Decide whether to load weight memmaps: only if edge caches are missing
         fonts = ['roman', 'italic', 'combined']
         need_edges = any(not os.path.exists(self._edge_cache_path(font, self.top_k, self.n_bins)) for font in fonts)
         # Check for per-font combined UMAP file (we only load combined positions at startup if present)
-        combined_umap_file = f'./data/umap_combined_{self._umap_n_neighbors}_{self._umap_min_dist}.npy'
+        combined_umap_file = umap_utils.umap_filename('combined', self._umap_n_neighbors, self._umap_min_dist, data_dir=self._data_dir)
         combined_umap_present = os.path.exists(combined_umap_file)
 
         # Check the dtype of n1hat_rm, n1hat_it
@@ -154,18 +171,20 @@ class BookSimilarityDashboard:
             self.n1hat_levels_max = 22  # sensible default
             print("Warning: failed to precompute linkages:", e)
 
-        if need_edges:
-            # Only load weight memmaps when needed for missing caches
-            w_rm_mmap = np.load(data_cfg.get("w_rm_matrix", './data/w_rm_matrix_ordered.npy'), mmap_mode='r')
-            w_it_mmap = np.load(data_cfg.get("w_it_matrix", './data/w_it_matrix_ordered.npy'), mmap_mode='r')
-            self._w_rm_mmap = w_rm_mmap
-            self._w_it_mmap = w_it_mmap
-            print("Loaded weight matrices as memory-mapped (needed for missing caches).")
-        else:
-            # Keep attributes None to signal weights are not loaded
+        # Load weight matrices as memory-mapped (cheap — needed for edges and UMAP)
+        try:
+            self._w_rm_mmap = np.load(self._resolve_data_path("w_rm_matrix", "w_rm_matrix_ordered.npy"), mmap_mode='r')
+            self._w_it_mmap = np.load(self._resolve_data_path("w_it_matrix", "w_it_matrix_ordered.npy"), mmap_mode='r')
+            print("Loaded weight matrices as memory-mapped.")
+        except Exception as e:
             self._w_rm_mmap = None
             self._w_it_mmap = None
-            print("Weight matrices not loaded (edge caches present).")
+            print(f"Warning: could not load weight matrices: {e}")
+
+        if need_edges:
+            print("Edge caches missing — will compute from weight matrices.")
+        else:
+            print("Edge caches present.")
 
         # Initialize printer markers dictionary (lightweight, no trace objects)
         self._printer_markers = self._get_printer_colors_dict()
@@ -174,8 +193,7 @@ class BookSimilarityDashboard:
         # Images will be loaded on-demand without caching
         self._load_metadata_for_letter_images()  # 3 images per letter
 
-        # Setup layout. Load combined UMAP positions only if the per-font combined UMAP file exists.
-        # We do NOT compute UMAP at startup if the file is missing; computation is deferred to user action.
+        # Setup layout. Load combined UMAP positions (computed via umap-learn if missing).
         self._setup_layout()
         self._setup_callbacks()
         
@@ -240,8 +258,8 @@ class BookSimilarityDashboard:
         # Ensure weight memmaps are loaded (lazy load on demand)
         if getattr(self, '_w_rm_mmap', None) is None or getattr(self, '_w_it_mmap', None) is None:
             try:
-                self._w_rm_mmap = np.load('./data/w_rm_matrix_ordered.npy', mmap_mode='r')
-                self._w_it_mmap = np.load('./data/w_it_matrix_ordered.npy', mmap_mode='r')
+                self._w_rm_mmap = np.load(self._resolve_data_path('w_rm_matrix', 'w_rm_matrix_ordered.npy'), mmap_mode='r')
+                self._w_it_mmap = np.load(self._resolve_data_path('w_it_matrix', 'w_it_matrix_ordered.npy'), mmap_mode='r')
                 print("Loaded weight matrices as memory-mapped (needed for edge computation).")
             except Exception as e:
                 print(f"Warning: Failed to load weight memmaps for edges: {e}")
@@ -396,17 +414,45 @@ class BookSimilarityDashboard:
         return traces
     
                 
-    def _load_umap_positions(self, font_type='combined', w_rm=None, w_it=None, w_combined=None, n_neighbors=None, min_dist=None, compute_if_missing=False):
-        """Load (or compute) UMAP positions.  Delegates to umap_utils."""
+    def _load_umap_positions(self, font_type='combined', w_rm=None, w_it=None, w_combined=None, n_neighbors=None, min_dist=None, compute_if_missing=True):
+        """Load (or compute) UMAP positions.  Delegates to umap_utils.
+
+        When the cached file is missing and *compute_if_missing* is True,
+        a distance matrix is built from the weight matrices and passed to
+        ``umap_utils.load_positions`` so UMAP can be computed on the fly
+        (requires ``umap-learn``).
+        """
         if n_neighbors is None:
             n_neighbors = getattr(self, '_umap_n_neighbors', 50)
         if min_dist is None:
             min_dist = getattr(self, '_umap_min_dist', 0.5)
+
+        # Build distance matrix from weight matrices when computation may be needed
+        distance_matrix = None
+        if compute_if_missing:
+            if w_rm is None:
+                w_rm = getattr(self, '_w_rm_mmap', None)
+            if w_it is None:
+                w_it = getattr(self, '_w_it_mmap', None)
+            if font_type == 'roman' and w_rm is not None:
+                distance_matrix = np.clip(1 - np.asarray(w_rm, dtype=np.float32), 0, 1)
+            elif font_type == 'italic' and w_it is not None:
+                distance_matrix = np.clip(1 - np.asarray(w_it, dtype=np.float32), 0, 1)
+            elif w_rm is not None and w_it is not None:
+                avg = (np.asarray(w_rm, dtype=np.float32) + np.asarray(w_it, dtype=np.float32)) / 2
+                distance_matrix = np.clip(1 - avg, 0, 1)
+            elif w_rm is not None:
+                distance_matrix = np.clip(1 - np.asarray(w_rm, dtype=np.float32), 0, 1)
+            elif w_it is not None:
+                distance_matrix = np.clip(1 - np.asarray(w_it, dtype=np.float32), 0, 1)
+
         return umap_utils.load_positions(
             font_type=font_type,
             n_neighbors=n_neighbors,
             min_dist=min_dist,
             compute_if_missing=compute_if_missing,
+            distance_matrix=distance_matrix,
+            data_dir=getattr(self, '_data_dir', './data'),
         )
 
     def _register_image_route(self):
@@ -687,7 +733,7 @@ class BookSimilarityDashboard:
 
         # If umap_positions is None, compute a fallback using networkx spring layout from edges
         if umap_positions is None:            
-            print(f"Warning: fallback layout failed ({e}), using zero positions")
+            print("Warning: no UMAP positions available, using zero positions")
             umap_positions = np.zeros((len(self.books), 2), dtype=np.float32)
         else:
             # Use asarray to avoid copying if already an array
@@ -1575,8 +1621,8 @@ class BookSimilarityDashboard:
 
     def _setup_layout(self, w_rm=None, w_it=None):
         """Compose the dashboard layout from sub-method components."""
-        # Load cached UMAP positions (do NOT compute at startup)
-        initial_umap = self._load_umap_positions(font_type='combined', w_rm=w_rm, w_it=w_it, compute_if_missing=False)
+        # Load cached UMAP positions, computing via umap-learn if missing
+        initial_umap = self._load_umap_positions(font_type='combined', w_rm=w_rm, w_it=w_it)
         initial_umap_list = initial_umap.tolist() if initial_umap is not None else None
         print("UMAP positions loaded (if cached), figures will be created on first render")
 
@@ -2469,7 +2515,7 @@ class BookSimilarityDashboard:
                 # Handle None case for UMAP positions (load cached combined if available, but do not abort if missing)
                 store_update = dash.no_update
                 if umap_pos_array is None:
-                    umap_pos_array = self._load_umap_positions(font_type='combined', compute_if_missing=False)
+                    umap_pos_array = self._load_umap_positions(font_type='combined')
                     if umap_pos_array is not None:
                         store_update = umap_pos_array.tolist()  # Update store with list for JSON
                 # Convert list to numpy array ONCE at start (from dcc.Store JSON) if available
@@ -2696,9 +2742,9 @@ class BookSimilarityDashboard:
         )
         def handle_umap_pos_source_change(pos_source, current_network_fig, edge_opacity, node_size, label_size, current_edge_font, network_legend_vis):
             # Try to load cached UMAP positions for selected source; do not compute automatically
-            umap_positions = self._load_umap_positions(font_type=pos_source, compute_if_missing=False)
+            umap_positions = self._load_umap_positions(font_type=pos_source)
             if umap_positions is None:
-                print(f"No cached UMAP positions for source '{pos_source}', computation deferred. Use Recalculate to compute.")
+                print(f"No UMAP positions for source '{pos_source}' (umap-learn may not be installed).")
                 return dash.no_update, dash.no_update
             umap_array = np.asarray(umap_positions, dtype=np.float32)
             # Recreate network using existing edge font selection (edges unaffected by position source)

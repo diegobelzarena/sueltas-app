@@ -25,14 +25,14 @@ def orient_positions(umap_positions):
     return umap_positions
 
 
-def umap_filename(font_type, n_neighbors, min_dist):
+def umap_filename(font_type, n_neighbors, min_dist, data_dir="./data"):
     """Return the expected .npy filename for a UMAP cache."""
-    return f"./data/umap_{font_type}_{n_neighbors}_{min_dist}.npy"
+    return os.path.join(data_dir, f"umap_{font_type}_{n_neighbors}_{min_dist}.npy")
 
 
 def load_positions(font_type="combined", n_neighbors=50, min_dist=0.5,
                    compute_if_missing=False, distance_matrix=None,
-                   random_state=42):
+                   random_state=42, data_dir="./data"):
     """Load cached UMAP positions, optionally computing if missing.
 
     Parameters
@@ -49,12 +49,14 @@ def load_positions(font_type="combined", n_neighbors=50, min_dist=0.5,
         when *compute_if_missing* is True.
     random_state : int
         Seed for reproducibility.
+    data_dir : str
+        Directory where UMAP cache files are stored.
 
     Returns
     -------
     np.ndarray of shape (n_books, 2) or None if unavailable.
     """
-    path = umap_filename(font_type, n_neighbors, min_dist)
+    path = umap_filename(font_type, n_neighbors, min_dist, data_dir=data_dir)
 
     if os.path.exists(path):
         positions = np.load(path)

@@ -12,7 +12,7 @@ print('Loading combined UMAP (cached)')
 umap_combined = b._load_umap_positions(font_type='combined', compute_if_missing=False)
 print('combined loaded:', umap_combined is not None)
 if umap_combined is None:
-    umap_combined = np.load('./data/umap_combined_50_0.5.npy')
+    umap_combined = np.load(os.path.join(os.path.dirname(__file__), '..', 'data', 'umap_combined_50_0.5.npy'))
 
 print('Building network figure...')
 fig_net = b._create_network_graph(umap_combined, edge_opacity=1.0, font_type='combined')

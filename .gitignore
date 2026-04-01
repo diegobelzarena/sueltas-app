@@ -29,6 +29,7 @@ profiles/
 # Data files — matrices & CSV are tracked; images are not
 data/images/
 data/images_cache_meta.pkl
+data_corpus2/
 
 # Archives
 *.tar
